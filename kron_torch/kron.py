@@ -99,7 +99,7 @@ class Kron(torch.optim.Optimizer):
                     for p in group["params"]
                 ]
 
-                # Print momentum buffer sizes (moved outside the loop)
+                # Print momentum buffer sizes
                 mu_n_elements = sum(m.numel() for m in group["momentum_buffer"])
                 mu_size_MB = sum(
                     m.numel() * m.element_size() / (2**20)
