@@ -19,6 +19,7 @@ keywords = [
     "machine learning",
     "optimization",
     "pytorch",
+    "opt_einsum",
 ]
 classifiers = [
     "Environment :: Console",
@@ -33,6 +34,7 @@ classifiers = [
 ]
 dependencies = [
     "torch",
+    "opt_einsum",
 ]
 
 [project.urls]
