@@ -204,10 +204,10 @@ class Kron(torch.optim.Optimizer):
 
 
 def norm_lower_bound(A):
-    """
-    Returns a cheap lower bound for the spectral norm of A.
-    Numerical results on random matrices with a wide range of distributions and sizes suggest,
-        norm(A) <= sqrt(2) * norm_lower_bound(A)
+    """Returns a cheap lower bound for the spectral norm of A.
+
+    Numerical results on random matrices with a wide range of distributions 
+        and sizes suggest, norm(A) <= sqrt(2) * norm_lower_bound(A).
     Looks to be a very tight lower bound.
     """
     max_abs = torch.max(
@@ -241,8 +241,8 @@ def norm_lower_bound(A):
 
 
 def init_Q_exprs(t, scale, max_size, max_skew, dtype=None):
-    """
-    For a scalar or tensor t, we initialize its preconditioner Q and reusable contraction expressions for updating Q and preconditioning gradient.
+    """For a scalar or tensor t, we initialize its preconditioner Q and 
+    reusable contraction expressions for updating Q and preconditioning gradient.
     """
     dtype = dtype if dtype is not None else t.dtype
     shape = t.shape
@@ -254,7 +254,8 @@ def init_Q_exprs(t, scale, max_size, max_skew, dtype=None):
     else:  # tensor
         if len(shape) > 26:
             raise ValueError(
-                f"Got tensor with dim {len(t.shape)}; Einstein runs out of letters; Replace 26 with larger numbers!"
+                f"Got tensor with dim {len(t.shape)}; Einstein runs out of letters; "
+                "Replace 26 with larger numbers!"
             )
 
         scale = scale ** (1 / len(shape))
@@ -374,12 +375,13 @@ def init_Q_exprs(t, scale, max_size, max_skew, dtype=None):
 
 def update_precond_kron_math_(Q, exprs, V, G, step, tiny):
     """
-    Update Kronecker product preconditioner Q with (vector, hess-vector-product) pair (V, G).
-    V is optional, and we can set it to None if it is integrated out (NOT recommend).
+    Update Kronecker product preconditioner Q with (vector, hess-vector-product)
+    pair (V, G). V is optional, and we can set it to None if it is integrated out
+    (NOT recommend).
     """
 
     def triangular_inv(A):
-        # return inv(A); used only when V is None, i.e., integrating out V; NOT recommend.
+        # return inv(A); used only when V is None, i.e., integrating out V
         I = torch.eye(A.shape[0], dtype=torch.float32, device=A.device)
         orig_dtype = A.dtype
         A = A.to(dtype=torch.float32)
@@ -425,7 +427,8 @@ def update_precond_kron_math_(Q, exprs, V, G, step, tiny):
             conjB = conjB / q if q.dim() < 2 else solve_triangular_right(conjB, q)
             if (
                 i < order - 1
-            ):  # transpose dims like [1,2,3,4,0]->[0,2,3,4,1]->[0,1,3,4,2]->[0,1,2,4,3]->[0,1,2,3,4]
+            ):  # transpose dims like 
+                # [1,2,3,4,0]->[0,2,3,4,1]->[0,1,3,4,2]->[0,1,2,4,3]->[0,1,2,3,4]
                 conjB = torch.transpose(conjB, i, order - 1)
     else:  # V is integrated out, and no need to form conjB
         conjB = None
@@ -464,4 +467,5 @@ def precond_grad_kron_math(Q, exprs, G):
     """
     Precondition gradient G with preconditioner Q.
     """
-    return exprs[-1](*[q.conj() for q in Q], *Q, G)  # the last expr is exprP
+    # the last expr is exprP
+    return exprs[-1](*[q.conj() for q in Q], *Q, G)
