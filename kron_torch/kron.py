@@ -159,17 +159,18 @@ class Kron(torch.optim.Optimizer):
                 for Q_exprs, mu in zip(self._Qs_exprs, group["momentum_buffer"])
             ]
 
-            # Apply weight decay
-            if group["weight_decay"] != 0:
-                for p, g in zip(group["params"], pre_grads):
-                    g.add_(p.to(dtype=g.dtype), alpha=group["weight_decay"])
-
             # Global gradient clipping
             torch.nn.utils.clip_grad_norm_(pre_grads, self._global_clip_norm)
 
             # Element-wise gradient clipping
             for g in pre_grads:
                 g.clamp_(-self._element_wise_clip, self._element_wise_clip)
+
+            # Apply weight decay
+            if group["weight_decay"] != 0:
+                for p, g in zip(group["params"], pre_grads):
+                    if p.dim() >= 2:
+                        g.add_(p.to(dtype=g.dtype), alpha=group["weight_decay"])
 
             # Update parameters
             for param, g in zip(group["params"], pre_grads):
