@@ -115,30 +115,29 @@ class Kron(torch.optim.Optimizer):
                     f"PSGD Momentum size: {mu_n_elements} elements, {mu_size_MB:.2f} MB"
                 )
 
-            for i, (p, m) in enumerate(zip(group["params"], group["momentum_buffer"])):
+            for p, m in zip(group["params"], group["momentum_buffer"]):
                 if p.grad is None:
                     continue
 
-                g = p.grad.to(dtype=m.dtype)
-                m.mul_(group["b1"]).add_(g, alpha=1 - group["b1"])
-                bias_correction = 1 - group["b1"] ** group["step"]
-                mu_hat = m / bias_correction
-                group["momentum_buffer"][i] = mu_hat
+                # perform calc in grad dtype
+                orig_dtype = m.dtype
+                m.to(dtype=p.grad.dtype)
+                m.mul_(group["b1"]).add_(p.grad, alpha=1 - group["b1"])
 
             if self._Qs_exprs is None:
                 self._Qs_exprs = [
                     init_Q_exprs(
-                        mu,
+                        m,
                         self._precond_init_scale,
                         group["max_size_triangular"],
                         group["max_skew_triangular"],
                         dtype=(
                             group["precond_dtype"]
                             if group["precond_dtype"] is not None
-                            else p.dtype
+                            else torch.float32
                         ),
                     )
-                    for mu, p in zip(group["momentum_buffer"], group["params"])
+                    for m in group["momentum_buffer"]
                 ]
 
                 # Print preconditioner sizes
@@ -159,28 +158,36 @@ class Kron(torch.optim.Optimizer):
                 update_prob = update_prob(group["step"])
 
             if torch.rand([]) < update_prob:
-                for Q_exprs, mu, p in zip(
+                for Q_exprs, m, p in zip(
                     self._Qs_exprs, group["momentum_buffer"], group["params"]
                 ):
                     precond_dtype = (
                         group["precond_dtype"]
                         if group["precond_dtype"] is not None
-                        else p.dtype
+                        else torch.float32
                     )
                     update_precond_kron_math_(
                         *Q_exprs,
-                        torch.randn_like(mu, dtype=precond_dtype),
-                        mu.to(dtype=precond_dtype),
+                        torch.randn_like(m, dtype=precond_dtype),
+                        m.to(dtype=precond_dtype),
                         group["precond_lr"],
                         "2nd",
                         self._tiny,
                     )
 
             # Precondition gradients
-            pre_grads = [
-                precond_grad_kron_math(*Q_exprs, mu)
-                for Q_exprs, mu in zip(self._Qs_exprs, group["momentum_buffer"])
-            ]
+            pre_grads = []
+            for Q_exprs, m, p in zip(
+                self._Qs_exprs, group["momentum_buffer"], group["params"]
+            ):
+                # perform calc in precond dtype then convert to param dtype
+                precond_dtype = (
+                    group["precond_dtype"]
+                    if group["precond_dtype"] is not None
+                    else torch.float32
+                )
+                pre_grad = precond_grad_kron_math(*Q_exprs, m.to(dtype=precond_dtype))
+                pre_grads.append(pre_grad.to(dtype=p.dtype))
 
             # Trust region
             # Global gradient clipping
@@ -196,6 +203,10 @@ class Kron(torch.optim.Optimizer):
 
             for param, g in zip(group["params"], pre_grads):
                 param.add_(g.to(dtype=param.dtype), alpha=-group["lr"])
+
+            # restore momentum buffer dtype
+            for m in group["momentum_buffer"]:
+                m.to(dtype=orig_dtype)
 
         return loss
 
@@ -377,17 +388,27 @@ def update_precond_kron_math_(Q, exprs, V, G, step, step_normalizer, tiny):
 
     def triangular_inv(A):
         # return inv(A); used only when V is None, i.e., integrating out V; NOT recommend.
-        I = torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
-        return torch.linalg.solve_triangular(A, I, upper=True)
+        I = torch.eye(A.shape[0], dtype=torch.float32, device=A.device)
+        orig_dtype = A.dtype
+        A = A.to(dtype=torch.float32)
+        return torch.linalg.solve_triangular(A, I, upper=True).to(dtype=orig_dtype)
 
     def solve_triangular_right(X, A):
         # return X @ inv(A)
         if X.dim() > 1:
-            return torch.linalg.solve_triangular(A, X, upper=True, left=False)
+            orig_dtype = X.dtype
+            X = X.to(dtype=torch.float32)
+            A = A.to(dtype=torch.float32)
+            return torch.linalg.solve_triangular(A, X, upper=True, left=False).to(
+                dtype=orig_dtype
+            )
         else:  # torch.linalg.solve_triangular complains if X.dim() < 2! So insert None
+            orig_dtype = X.dtype
+            X = X.to(dtype=torch.float32)
+            A = A.to(dtype=torch.float32)
             return torch.linalg.solve_triangular(A, X[None, :], upper=True, left=False)[
                 0
-            ]
+            ].to(dtype=orig_dtype)
 
     order = G.dim()  # order of tensor
     if order > 1 and torch.rand([]) < 0.01:
