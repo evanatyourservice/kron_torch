@@ -19,7 +19,6 @@ keywords = [
     "machine learning",
     "optimization",
     "pytorch",
-    "opt_einsum",
 ]
 classifiers = [
     "Environment :: Console",
