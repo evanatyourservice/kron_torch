@@ -51,7 +51,7 @@ b2 or epsilon.
 learning rate. Try setting 3x higher. If 0.001 was best for adam, try setting kron's to 0.003.
 
 `weight_decay`: PSGD does not rely on weight decay for generalization as much as adam, and too
-high weight decay can hurt performance. Try setting 10x lower. If the best weight decay for 
+high weight decay can hurt performance. Try setting 3-10x lower. If the best weight decay for 
 adam was 0.1, you can set kron's to 0.03 or 0.01.
 
 `max_size_triangular`: Anything above this value will have a diagonal preconditioner, anything 
