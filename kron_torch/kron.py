@@ -79,6 +79,36 @@ class Kron(torch.optim.Optimizer):
         self._tiny = 1e-30
         self._Qs_exprs = None
 
+        # Calculate and print sizes for momentum buffers
+        mu_n_elements = sum(p.numel() for p in self._params_with_grad)
+        mu_size_MB = sum(p.numel() * p.element_size() / (2**20) for p in self._params_with_grad)
+        print(f"PSGD Momentum size: {mu_n_elements} elements, {mu_size_MB:.2f} MB")
+
+        # Initialize preconditioners and calculate their sizes
+        self._init_preconditioners(group)
+        self._print_preconditioner_sizes()
+
+    def _init_preconditioners(self, group):
+        self._Qs_exprs = [
+            init_Q_exprs(
+                torch.zeros_like(p),  # Use zeros as a placeholder for momentum
+                1.0,  # init scale hardcoded to 1.0
+                group["max_size_triangular"],
+                group["max_skew_triangular"],
+                dtype=(
+                    group["precond_dtype"]
+                    if group["precond_dtype"] is not None
+                    else p.dtype
+                ),
+            )
+            for p in self._params_with_grad
+        ]
+
+    def _print_preconditioner_sizes(self):
+        Qs_n_elements = sum(sum(q.numel() for q in Q[0]) for Q in self._Qs_exprs)
+        Qs_size_MB = sum(sum(q.numel() * q.element_size() / (2**20) for q in Q[0]) for Q in self._Qs_exprs)
+        print(f"PSGD Preconditioners size: {Qs_n_elements} elements, {Qs_size_MB:.2f} MB")
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
