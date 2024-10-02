@@ -29,6 +29,10 @@ pip install kron-torch
 
 ## Basic Usage (Kron)
 
+Kron schedules the preconditioner update probability by default to start at 1.0 and anneal to 0.03 
+at the beginning of training, so training will be slightly slower at the start but will speed up 
+to near adam's speed by around 3k steps.
+
 For basic usage, use `kron` optimizer like any other pytorch optimizer:
 
 ```python
