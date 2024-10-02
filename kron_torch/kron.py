@@ -66,13 +66,8 @@ class Kron(torch.optim.Optimizer):
         )
         super(Kron, self).__init__(params, defaults)
 
-        self._params_with_grad = []
-        total_params = 0
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.requires_grad:
-                    self._params_with_grad.append(p)
-                    total_params += p.numel()
+        self._params_with_grad = [p for group in self.param_groups for p in group["params"] if p.requires_grad]
+        total_params = sum(p.numel() for p in self._params_with_grad)
 
         self._global_clip_norm = total_params**0.5
         self._element_wise_clip = 1.0
@@ -136,14 +131,10 @@ class Kron(torch.optim.Optimizer):
             # Trust region
             self._apply_trust_region(pre_grads)
 
-            # Apply weight decay
-            if weight_decay != 0:
-                for p, g in zip(group["params"], pre_grads):
-                    if p.dim() >= 2:
-                        g.add_(p, alpha=weight_decay)
-
-            # Update parameters
+            # Apply weight decay and update parameters
             for param, g in zip(group["params"], pre_grads):
+                if weight_decay != 0 and param.dim() >= 2:
+                    g.add_(param, alpha=weight_decay)
                 param.add_(g, alpha=-lr)
 
             # Restore momentum buffer dtype (if needed)
