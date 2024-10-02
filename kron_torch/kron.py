@@ -66,7 +66,9 @@ class Kron(torch.optim.Optimizer):
         )
         super(Kron, self).__init__(params, defaults)
 
-        self._params_with_grad = [p for group in self.param_groups for p in group["params"] if p.requires_grad]
+        self._params_with_grad = [
+            p for group in self.param_groups for p in group["params"] if p.requires_grad
+        ]
         total_params = sum(p.numel() for p in self._params_with_grad)
 
         self._global_clip_norm = total_params**0.5
@@ -109,13 +111,16 @@ class Kron(torch.optim.Optimizer):
             weight_decay = group["weight_decay"]
 
             # Update momentum buffers
+            params_with_grad = []
+            momentum_buffer_with_grad = []
             for p, m in zip(group["params"], group["momentum_buffer"]):
-                if p.grad is None:
-                    continue
-                m.mul_(b1).add_(p.grad, alpha=1 - b1)
+                if p.grad is not None:
+                    params_with_grad.append(p)
+                    momentum_buffer_with_grad.append(m)
+                    m.mul_(b1).add_(p.grad, alpha=1 - b1)
 
             if self._Qs_exprs is None:
-                self._init_Qs_exprs(group, precond_dtype)
+                self._init_Qs_exprs(momentum_buffer_with_grad, group, precond_dtype)
 
             # Update preconditioner
             update_prob = group["preconditioner_update_probability"]
@@ -123,16 +128,20 @@ class Kron(torch.optim.Optimizer):
                 update_prob = update_prob(group["step"])
 
             if torch.rand([], device=p.device) < update_prob:
-                self._update_preconditioner(group, precond_dtype)
+                self._update_preconditioner(
+                    momentum_buffer_with_grad, group, precond_dtype
+                )
 
             # Precondition gradients
-            pre_grads = self._precondition_gradients(group, precond_dtype)
+            pre_grads = self._precondition_gradients(
+                momentum_buffer_with_grad, params_with_grad, group, precond_dtype
+            )
 
-            # Trust region
+            # Apply trust region
             self._apply_trust_region(pre_grads)
 
             # Apply weight decay and update parameters
-            for param, g in zip(group["params"], pre_grads):
+            for param, g in zip(params_with_grad, pre_grads):
                 if weight_decay != 0 and param.dim() >= 2:
                     g.add_(param, alpha=weight_decay)
                 param.add_(g, alpha=-lr)
@@ -144,7 +153,7 @@ class Kron(torch.optim.Optimizer):
 
         return loss
 
-    def _init_Qs_exprs(self, group, precond_dtype):
+    def _init_Qs_exprs(self, momentum_buffer_with_grad, group, precond_dtype):
         self._Qs_exprs = [
             init_Q_exprs(
                 m,
@@ -153,7 +162,7 @@ class Kron(torch.optim.Optimizer):
                 group["max_skew_triangular"],
                 dtype=precond_dtype,
             )
-            for m in group["momentum_buffer"]
+            for m in momentum_buffer_with_grad
         ]
 
         # Print preconditioner sizes
@@ -166,8 +175,8 @@ class Kron(torch.optim.Optimizer):
             f"PSGD Preconditioners size: {Qs_n_elements} elements, {Qs_size_MB:.2f} MB"
         )
 
-    def _update_preconditioner(self, group, precond_dtype):
-        for Q_exprs, m in zip(self._Qs_exprs, group["momentum_buffer"]):
+    def _update_preconditioner(self, momentum_buffer_with_grad, group, precond_dtype):
+        for Q_exprs, m in zip(self._Qs_exprs, momentum_buffer_with_grad):
             update_precond_kron_math_(
                 *Q_exprs,
                 torch.randn_like(m, dtype=precond_dtype),
@@ -176,13 +185,15 @@ class Kron(torch.optim.Optimizer):
                 self._tiny,
             )
 
-    def _precondition_gradients(self, group, precond_dtype):
+    def _precondition_gradients(
+        self, momentum_buffer_with_grad, params_with_grad, group, precond_dtype
+    ):
         return [
             precond_grad_kron_math(
                 *Q_exprs, m.to(dtype=precond_dtype, non_blocking=True)
             ).to(dtype=p.dtype, non_blocking=True)
             for Q_exprs, m, p in zip(
-                self._Qs_exprs, group["momentum_buffer"], group["params"]
+                self._Qs_exprs, momentum_buffer_with_grad, params_with_grad
             )
         ]
 
@@ -197,7 +208,7 @@ class Kron(torch.optim.Optimizer):
 def norm_lower_bound(A):
     """Returns a cheap lower bound for the spectral norm of A.
 
-    Numerical results on random matrices with a wide range of distributions 
+    Numerical results on random matrices with a wide range of distributions
         and sizes suggest, norm(A) <= sqrt(2) * norm_lower_bound(A).
     Looks to be a very tight lower bound.
     """
@@ -232,7 +243,7 @@ def norm_lower_bound(A):
 
 
 def init_Q_exprs(t, scale, max_size, max_skew, dtype=None):
-    """For a scalar or tensor t, we initialize its preconditioner Q and 
+    """For a scalar or tensor t, we initialize its preconditioner Q and
     reusable contraction expressions for updating Q and preconditioning gradient.
     """
     dtype = dtype if dtype is not None else t.dtype
@@ -416,9 +427,7 @@ def update_precond_kron_math_(Q, exprs, V, G, step, tiny):
         )  # permute dims like [0,1,2,3,4] -> [1,2,3,4,0]
         for i, q in enumerate(Q):
             conjB = conjB / q if q.dim() < 2 else solve_triangular_right(conjB, q)
-            if (
-                i < order - 1
-            ):  # transpose dims like 
+            if i < order - 1:  # transpose dims like
                 # [1,2,3,4,0]->[0,2,3,4,1]->[0,1,3,4,2]->[0,1,2,4,3]->[0,1,2,3,4]
                 conjB = torch.transpose(conjB, i, order - 1)
     else:  # V is integrated out, and no need to form conjB

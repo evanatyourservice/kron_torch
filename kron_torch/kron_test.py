@@ -1,141 +1,151 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
 from kron import Kron
-import matplotlib.pyplot as plt
-import math
-
-torch.manual_seed(42)
 
 
-class QuadraticModel(nn.Module):
-    def __init__(self, a, b, c):
-        super().__init__()
-        self.a = nn.Parameter(torch.tensor([a]))
-        self.b = nn.Parameter(torch.tensor([b]))
-        self.c = nn.Parameter(torch.tensor([c]))
+class SimpleConvNet(nn.Module):
+    def __init__(self):
+        super(SimpleConvNet, self).__init__()
+        self.scalar = nn.Parameter(torch.ones(1))
+        self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
+        self.ln1 = nn.LayerNorm([10, 12, 12])
+        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
+        self.ln2 = nn.LayerNorm([20, 4, 4])
+        self.fc1 = nn.Linear(320, 50)
+        self.ln3 = nn.LayerNorm(50)
+        self.fc2 = nn.Linear(50, 10)
+        self.static_param = nn.Parameter(torch.randn(1), requires_grad=False)
 
     def forward(self, x):
-        return self.a * x**2 + self.b * x + self.c
+        x = self.scalar * x
+        x = F.relu(F.max_pool2d(self.conv1(x), 2))
+        x = self.ln1(x)
+        x = F.relu(F.max_pool2d(self.conv2(x), 2))
+        x = self.ln2(x)
+        x = x.view(-1, 320)
+        x = F.relu(self.fc1(x))
+        x = self.ln3(x)
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
 
 
-def generate_data(num_samples=1000):
-    x = torch.linspace(-10, 10, num_samples).unsqueeze(1)
-    true_a, true_b, true_c = 2.0, -3.0, 5.0
-    y = true_a * x**2 + true_b * x + true_c + torch.randn_like(x) * 0.1
-    return x, y, (true_a, true_b, true_c)
+def print_model_summary(model):
+    print("Model Summary:")
+    total_params = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"{name}: {param.shape}, requires_grad=True")
+            total_params += param.numel()
+        else:
+            print(f"{name}: {param.shape}, requires_grad=False")
+    print(f"Total trainable parameters: {total_params}")
 
 
-def train(model, optimizer, criterion, X, y, num_epochs=1000):
-    initial_lr = optimizer.param_groups[0]["lr"]
-    losses = []
-
-    for epoch in range(num_epochs):
-        current_lr = initial_lr * (1 - epoch / num_epochs)
-        optimizer.param_groups[0]["lr"] = current_lr
-
+def train(model, device, train_loader, optimizer, scheduler, epoch):
+    initial_static_param = model.static_param.clone()
+    model.train()
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        outputs = model(X)
-        loss = criterion(outputs, y)
+        output = model(data)
+        loss = F.nll_loss(output, target)
         loss.backward()
-
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
-
-        losses.append(loss.item())
-
-        if (epoch + 1) % 100 == 0:
+        scheduler.step()
+        if batch_idx % 50 == 0:
             print(
-                f"Epoch {epoch+1:4d}: Loss = {loss.item():.4f}, LR = {current_lr:.6f}, "
-                f"a = {model.a.item():.4f}, b = {model.b.item():.4f}, c = {model.c.item():.4f}"
+                f"Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} "
+                f"({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}"
             )
-
-    return losses
-
-
-def evaluate_model(model, criterion, X, y):
-    return criterion(model(X), y).item()
+    assert torch.allclose(
+        model.static_param, initial_static_param
+    ), "Static parameter changed during training!"
 
 
-def plot_results(X, y, true_params, model_kron, model_sgd):
-    plt.figure(figsize=(12, 8))
-    plt.scatter(X, y, alpha=0.1, label="Data")
-    x_plot = torch.linspace(-10, 10, 200).unsqueeze(1)
-    plt.plot(
-        x_plot,
-        true_params[0] * x_plot**2 + true_params[1] * x_plot + true_params[2],
-        "r-",
-        label="True",
+def test(model, device, test_loader):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += F.nll_loss(output, target, reduction="sum").item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    test_loss /= len(test_loader.dataset)
+    accuracy = 100.0 * correct / len(test_loader.dataset)
+    print(
+        f"\nTest set: Average loss: {test_loss:.4f}, Accuracy: "
+        f"{correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n"
     )
-    plt.plot(x_plot, model_kron(x_plot).detach(), "g-", label="Kron")
-    plt.plot(x_plot, model_sgd(x_plot).detach(), "b-", label="SGD")
-    plt.legend()
-    plt.title("Quadratic Function Fitting")
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.savefig("quadratic_fitting.png")
-    plt.close()
+    return accuracy
 
 
 def main():
-    X_train, y_train, true_params = generate_data()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    criterion = nn.MSELoss()
-    num_epochs = 1000
-
-    model_kron = QuadraticModel(1.0, 1.0, 1.0)
-    model_sgd = QuadraticModel(1.0, 1.0, 1.0)
-
-    optimizer_kron = Kron(model_kron.parameters(), lr=0.02)
-    optimizer_sgd = torch.optim.SGD(model_sgd.parameters(), lr=1.0)
-
-    initial_loss_kron = evaluate_model(model_kron, criterion, X_train, y_train)
-    initial_loss_sgd = evaluate_model(model_sgd, criterion, X_train, y_train)
-
-    print("Training Kron")
-    losses_kron = train(
-        model_kron, optimizer_kron, criterion, X_train, y_train, num_epochs
-    )
-    print("Training SGD")
-    losses_sgd = train(
-        model_sgd, optimizer_sgd, criterion, X_train, y_train, num_epochs
+    transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
     )
 
-    final_loss_kron = evaluate_model(model_kron, criterion, X_train, y_train)
-    final_loss_sgd = evaluate_model(model_sgd, criterion, X_train, y_train)
-
-    kron_decrease = (initial_loss_kron - final_loss_kron) / initial_loss_kron * 100
-    sgd_decrease = (initial_loss_sgd - final_loss_sgd) / initial_loss_sgd * 100
-
-    print(f"Loss Decrease: Kron: {kron_decrease:.2f}%, SGD: {sgd_decrease:.2f}%")
-    print(f"True params: {true_params}")
-    print(
-        f"Kron params: {model_kron.a.item():.4f}, {model_kron.b.item():.4f}, {model_kron.c.item():.4f}"
+    train_dataset = datasets.MNIST(
+        "../data", train=True, download=True, transform=transform
     )
-    print(
-        f"SGD params:  {model_sgd.a.item():.4f}, {model_sgd.b.item():.4f}, {model_sgd.c.item():.4f}"
+    test_dataset = datasets.MNIST("../data", train=False, transform=transform)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=256, shuffle=True
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=1000, shuffle=False
     )
 
-    if not math.isnan(final_loss_sgd) and not math.isnan(final_loss_kron):
-        print(
-            "Kron outperformed SGD"
-            if kron_decrease > sgd_decrease
-            else "SGD outperformed Kron"
-        )
-    else:
-        print("Warning: NaN values encountered")
+    model_kron = SimpleConvNet().to(device)
+    model_sgd = SimpleConvNet().to(device)
+    model_sgd.load_state_dict(model_kron.state_dict())
 
-    plot_results(X_train, y_train, true_params, model_kron, model_sgd)
+    print_model_summary(model_kron)
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(losses_kron, label="Kron")
-    plt.plot(losses_sgd, label="SGD")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training Loss")
-    plt.legend()
-    plt.savefig("training_loss.png")
-    plt.close()
+    print(f"Initial static param (Kron): {model_kron.static_param.item():.4f}")
+    print(f"Initial static param (SGD): {model_sgd.static_param.item():.4f}")
+
+    optimizer_kron = Kron(model_kron.parameters(), lr=0.001, weight_decay=0.0001)
+    optimizer_sgd = torch.optim.SGD(
+        model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
+    )
+
+    num_epochs = 2
+    steps_per_epoch = len(train_loader)
+    total_steps = num_epochs * steps_per_epoch
+
+    scheduler_kron = torch.optim.lr_scheduler.LinearLR(
+        optimizer_kron, start_factor=1.0, end_factor=0.0, total_iters=total_steps
+    )
+    scheduler_sgd = torch.optim.lr_scheduler.LinearLR(
+        optimizer_sgd, start_factor=1.0, end_factor=0.0, total_iters=total_steps
+    )
+
+    print("Training with Kron optimizer:")
+    for epoch in range(1, num_epochs + 1):
+        train(model_kron, device, train_loader, optimizer_kron, scheduler_kron, epoch)
+    kron_accuracy = test(model_kron, device, test_loader)
+
+    print("\nTraining with SGD optimizer:")
+    for epoch in range(1, num_epochs + 1):
+        train(model_sgd, device, train_loader, optimizer_sgd, scheduler_sgd, epoch)
+    sgd_accuracy = test(model_sgd, device, test_loader)
+
+    print(f"\nFinal results:")
+    print(f"Kron accuracy: {kron_accuracy:.2f}%")
+    print(f"SGD accuracy: {sgd_accuracy:.2f}%")
+    print(f"Scalar value (Kron): {model_kron.scalar.item():.4f}")
+    print(f"Scalar value (SGD): {model_sgd.scalar.item():.4f}")
+    print(f"Final static param (Kron): {model_kron.static_param.item():.4f}")
+    print(f"Final static param (SGD): {model_sgd.static_param.item():.4f}")
 
 
 if __name__ == "__main__":
