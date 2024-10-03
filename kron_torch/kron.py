@@ -31,6 +31,28 @@ def precond_update_prob_schedule(
 
 
 class Kron(torch.optim.Optimizer):
+    """Implements PSGD Kron from https://github.com/lixilinx/psgd_torch.
+
+    Args:
+        params (iterable): Iterable of parameters to optimize or dicts defining
+            parameter groups.
+        lr (float, optional): Learning rate (default: 0.001).
+        b1 (float, optional): Momentum parameter (default: 0.9).
+        weight_decay (float, optional): Weight decay (L2 penalty) (default: 0.0).
+        preconditioner_update_probability (callable or float, optional): Probability of
+            updating the preconditioner. If None, defaults to a schedule that anneals
+            from 1.0 to 0.03 by 4000 steps.
+        max_size_triangular (int, optional): Max size for dim's preconditioner to be
+            triangular (default: 8192).
+        max_skew_triangular (float, optional): Max skew for dim's preconditioner to be
+            triangular (default: inf).
+        min_ndim_triangular (int, optional): Minimum number of dimensions a layer needs
+            to have triangular preconditioners (default: 2).
+        mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator. Defaults
+            to the same dtype as the parameters.
+        precond_dtype (torch.dtype, optional): Dtype of the preconditioner (default: None).
+    """
+
     def __init__(
         self,
         params,
@@ -68,15 +90,17 @@ class Kron(torch.optim.Optimizer):
         )
         super(Kron, self).__init__(params, defaults)
 
-        self._params_with_grad = [
-            p for group in self.param_groups for p in group["params"] if p.requires_grad
-        ]
-        total_params = sum(p.numel() for p in self._params_with_grad)
-
-        self._global_clip_norm = total_params**0.5
+        self._global_clip_norm = (
+            sum(
+                p.numel()
+                for group in self.param_groups
+                for p in group["params"]
+                if p.requires_grad
+            )
+            ** 0.5
+        )
         self._element_wise_clip = 1.0
         self._tiny = 1e-30
-        self._Qs_exprs = None
         self._precond_init_scale = 1.0
 
     @torch.no_grad()
@@ -87,76 +111,76 @@ class Kron(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            group["step"] = group.get("step", 0) + 1
-
             precond_dtype = group.get("precond_dtype", torch.float32)
             mu_dtype = group.get("mu_dtype")
 
-            if "momentum_buffer" not in group:
-                group["momentum_buffer"] = [
-                    torch.zeros_like(p, dtype=mu_dtype or p.dtype)
-                    for p in group["params"]
-                ]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
 
-                # Print momentum buffer sizes
-                mu_n_elements = sum(m.numel() for m in group["momentum_buffer"])
-                mu_size_MB = sum(
-                    m.numel() * m.element_size() / (2**20)
-                    for m in group["momentum_buffer"]
-                )
-                print(
-                    f"PSGD Momentum size: {mu_n_elements} elements, {mu_size_MB:.2f} MB"
-                )
+                grad = p.grad
+                state = self.state[p]
 
-            b1 = group["b1"]
-            lr = group["lr"]
-            weight_decay = group["weight_decay"]
+                # Lazy state initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["momentum_buffer"] = torch.zeros_like(
+                        p, dtype=mu_dtype or p.dtype
+                    )
+                    state["Q"], state["exprs"] = init_Q_exprs(
+                        p,
+                        self._precond_init_scale,
+                        group["max_size_triangular"],
+                        group["max_skew_triangular"],
+                        group["min_ndim_triangular"],
+                        dtype=precond_dtype,
+                    )
 
-            # Update momentum buffers
-            params_with_grad = []
-            momentum_buffer_with_grad = []
-            for p, m in zip(group["params"], group["momentum_buffer"]):
-                if p.grad is not None:
-                    params_with_grad.append(p)
-                    momentum_buffer_with_grad.append(m)
-                    m.mul_(b1).add_(p.grad, alpha=1 - b1)
+                state["step"] += 1
 
-            if self._Qs_exprs is None:
-                self._init_Qs_exprs(momentum_buffer_with_grad, group, precond_dtype)
+                # Update momentum buffer
+                momentum_buffer = state["momentum_buffer"]
+                momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
 
-            # Update preconditioner
-            update_prob = group["preconditioner_update_probability"]
-            if callable(update_prob):
-                update_prob = update_prob(group["step"])
+                # Update preconditioner
+                update_prob = group["preconditioner_update_probability"]
+                if callable(update_prob):
+                    update_prob = update_prob(state["step"])
 
-            if torch.rand([], device=p.device) < update_prob:
-                self._update_preconditioner(
-                    momentum_buffer_with_grad, group, precond_dtype
-                )
+                if torch.rand([], device=p.device) < update_prob:
+                    update_precond_kron_math_(
+                        state["Q"],
+                        state["exprs"],
+                        torch.randn_like(momentum_buffer, dtype=precond_dtype),
+                        momentum_buffer.to(dtype=precond_dtype, non_blocking=True),
+                        group["precond_lr"],
+                        self._tiny,
+                    )
 
-            # Precondition gradients
-            pre_grads = self._precondition_gradients(
-                momentum_buffer_with_grad, params_with_grad, group, precond_dtype
-            )
+                # Precondition gradients
+                pre_grad = precond_grad_kron_math(
+                    state["Q"],
+                    state["exprs"],
+                    momentum_buffer.to(dtype=precond_dtype, non_blocking=True),
+                ).to(dtype=p.dtype, non_blocking=True)
 
-            # Apply trust region
-            self._apply_trust_region(pre_grads)
+                # Apply trust region
+                torch.nn.utils.clip_grad_norm_([pre_grad], self._global_clip_norm)
+                pre_grad.clamp_(-self._element_wise_clip, self._element_wise_clip)
 
-            # Apply weight decay and update parameters
-            for param, g in zip(params_with_grad, pre_grads):
-                if weight_decay != 0 and param.dim() >= 2:
-                    g.add_(param, alpha=weight_decay)
-                param.add_(g, alpha=-lr)
+                # Apply weight decay and update parameters
+                if group["weight_decay"] != 0 and p.dim() >= 2:
+                    pre_grad.add_(p, alpha=group["weight_decay"])
+                p.add_(pre_grad, alpha=-group["lr"])
 
-            # Restore momentum buffer dtype (if needed)
-            if mu_dtype is not None:
-                for m in group["momentum_buffer"]:
-                    m.to(dtype=mu_dtype, non_blocking=True, copy=False)
+                # Restore momentum buffer dtype (if needed)
+                if mu_dtype is not None:
+                    momentum_buffer.to(dtype=mu_dtype, non_blocking=True, copy=False)
 
         return loss
 
     def _init_Qs_exprs(self, momentum_buffer_with_grad, group, precond_dtype):
-        self._Qs_exprs = [
+        Qs_exprs = [
             init_Q_exprs(
                 m,
                 self._precond_init_scale,
@@ -169,43 +193,15 @@ class Kron(torch.optim.Optimizer):
         ]
 
         # Print preconditioner sizes
-        Qs_n_elements = sum(sum(q.numel() for q in Q[0]) for Q in self._Qs_exprs)
+        Qs_n_elements = sum(sum(q.numel() for q in Q[0]) for Q in Qs_exprs)
         Qs_size_MB = sum(
-            sum(q.numel() * q.element_size() / (2**20) for q in Q[0])
-            for Q in self._Qs_exprs
+            sum(q.numel() * q.element_size() / (2**20) for q in Q[0]) for Q in Qs_exprs
         )
         print(
             f"PSGD Preconditioners size: {Qs_n_elements} elements, {Qs_size_MB:.2f} MB"
         )
 
-    def _update_preconditioner(self, momentum_buffer_with_grad, group, precond_dtype):
-        for Q_exprs, m in zip(self._Qs_exprs, momentum_buffer_with_grad):
-            update_precond_kron_math_(
-                *Q_exprs,
-                torch.randn_like(m, dtype=precond_dtype),
-                m.to(dtype=precond_dtype, non_blocking=True),
-                group["precond_lr"],
-                self._tiny,
-            )
-
-    def _precondition_gradients(
-        self, momentum_buffer_with_grad, params_with_grad, group, precond_dtype
-    ):
-        return [
-            precond_grad_kron_math(
-                *Q_exprs, m.to(dtype=precond_dtype, non_blocking=True)
-            ).to(dtype=p.dtype, non_blocking=True)
-            for Q_exprs, m, p in zip(
-                self._Qs_exprs, momentum_buffer_with_grad, params_with_grad
-            )
-        ]
-
-    def _apply_trust_region(self, pre_grads):
-        # Global gradient clipping
-        torch.nn.utils.clip_grad_norm_(pre_grads, self._global_clip_norm)
-        # Element-wise gradient clipping
-        for g in pre_grads:
-            g.clamp_(-self._element_wise_clip, self._element_wise_clip)
+        return Qs_exprs
 
 
 def norm_lower_bound(A):

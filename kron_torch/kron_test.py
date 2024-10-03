@@ -113,7 +113,9 @@ def main():
     print(f"Initial static param (Kron): {model_kron.static_param.item():.4f}")
     print(f"Initial static param (SGD): {model_sgd.static_param.item():.4f}")
 
-    optimizer_kron = Kron(model_kron.parameters(), lr=0.001, weight_decay=0.0001)
+    optimizer_kron = Kron(
+        model_kron.parameters(), lr=0.001, weight_decay=0.0001, max_skew_triangular=1
+    )  # should be largest dim diag, rest tri
     optimizer_sgd = torch.optim.SGD(
         model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
     )
@@ -133,6 +135,46 @@ def main():
     for epoch in range(1, num_epochs + 1):
         train(model_kron, device, train_loader, optimizer_kron, scheduler_kron, epoch)
     kron_accuracy = test(model_kron, device, test_loader)
+
+    # Updated section to print Kron optimizer states
+    print("\nKron optimizer states:")
+    for group_idx, group in enumerate(optimizer_kron.param_groups):
+        print(f"Parameter group {group_idx}:")
+        for p in group["params"]:
+            if p.requires_grad:
+                state = optimizer_kron.state[p]
+                print(f"  Parameter: shape={p.shape}, dtype={p.dtype}")
+                if state:
+                    for key, value in state.items():
+                        if key == "Q":
+                            print(f"    Q: list of {len(value)} tensors")
+                            for i, q_tensor in enumerate(value):
+                                print(
+                                    f"      Q[{i}]: shape={q_tensor.shape}, dtype={q_tensor.dtype}"
+                                )
+                        elif key == "exprs":
+                            print(f"    exprs: tuple of {len(value)} expressions")
+                        elif isinstance(value, torch.Tensor):
+                            print(
+                                f"    {key}: shape={value.shape}, dtype={value.dtype}"
+                            )
+                        else:
+                            print(f"    {key}: {type(value)}")
+                else:
+                    print("    No state")
+
+    # Print additional optimizer attributes
+    print("\nOptimizer attributes:")
+    for attr_name in dir(optimizer_kron):
+        if not attr_name.startswith("_") and attr_name not in ["state", "param_groups"]:
+            attr_value = getattr(optimizer_kron, attr_name)
+            if not callable(attr_value):
+                if isinstance(attr_value, torch.Tensor):
+                    print(
+                        f"  {attr_name}: shape={attr_value.shape}, dtype={attr_value.dtype}"
+                    )
+                else:
+                    print(f"  {attr_name}: {type(attr_value)}")
 
     print("\nTraining with SGD optimizer:")
     for epoch in range(1, num_epochs + 1):

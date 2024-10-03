@@ -47,9 +47,9 @@ optimizer.step()
 
 **Basic hyperparameters:**
 
-TLDR: Learning rate acts similarly to adam's, but can be set a little higher like 0.001 -> 
-0.003. Weight decay should be set lower than adam's, like 0.1 -> 0.03 or 0.01. There is no
-b2 or epsilon.
+TLDR: Learning rate and weight decay act similarly to adam, but lr might be able to be a little 
+higher like 0.001 -> 0.002 or 0.003, and weight decay might be best a little lower like 
+0.1 -> 0.05 or 0.03. There is no b2 or epsilon.
 
 `learning_rate`: Kron's learning rate acts similarly to adam's, but can withstand a higher 
 learning rate. Try setting 3x higher. If 0.001 was best for adam, try setting kron's to 0.003.
@@ -69,10 +69,13 @@ For example, with the default value for `max_skew_triangular` as 10, a bias laye
 be (diag, tri) because 50000/768 is greater than 10. The default value of 10 usually makes 
 layers like bias, scale, and vocab embedding use diagonal with the rest as triangular.
 
-Interesting note: Setting `max_skew_triangular` to 0 will make all layers have (diag, tri) 
-preconditioners which uses slightly less memory than adam (and runs slightly faster). Setting 
-`max_size_triangular` to 0 will make all layers have diagonal preconditioners which uses the least 
-memory and runs the fastest, but training might be slower.
+`min_ndim_triangular`: Any tensor with less than this number of dims will have all diagonal 
+preconditioners. Default is 2, so single-dim tensors like bias and scale will use diagonal.
+
+Interesting note: Setting `max_skew_triangular` to 1 will make the largest dim have a diagonal 
+preconditioner and the rest have triangular, which usually uses slightly less memory than adam. 
+Setting `max_size_triangular` to 0 will make all layers have diagonal preconditioners which uses 
+the least memory and runs the fastest, but performance might be worse.
 
 `preconditioner_update_probability`: Preconditioner update probability uses a schedule by default 
 that works well for most cases. It anneals from 1 to 0.03 at the beginning of training, so training 
