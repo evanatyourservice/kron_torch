@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "kron-torch"
-version = "0.1.9"
+version = "0.1.10"
 description = "An implementation of PSGD Kron optimizer in PyTorch."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }

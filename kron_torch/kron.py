@@ -110,6 +110,11 @@ class Kron(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        total_momentum_size = 0
+        total_momentum_mb = 0
+        total_precond_size = 0
+        total_precond_mb = 0
+
         for group in self.param_groups:
             precond_dtype = group.get("precond_dtype", torch.float32)
             mu_dtype = group.get("mu_dtype")
@@ -121,7 +126,6 @@ class Kron(torch.optim.Optimizer):
                 grad = p.grad
                 state = self.state[p]
 
-                # Lazy state initialization
                 if len(state) == 0:
                     state["step"] = 0
                     state["momentum_buffer"] = torch.zeros_like(
@@ -135,6 +139,17 @@ class Kron(torch.optim.Optimizer):
                         group["min_ndim_triangular"],
                         dtype=precond_dtype,
                     )
+
+                    # Calculate sizes
+                    momentum_size = state["momentum_buffer"].numel()
+                    momentum_mb = momentum_size * state["momentum_buffer"].element_size() / (2**20)
+                    total_momentum_size += momentum_size
+                    total_momentum_mb += momentum_mb
+
+                    precond_size = sum(q.numel() for q in state["Q"])
+                    precond_mb = sum(q.numel() * q.element_size() for q in state["Q"]) / (2**20)
+                    total_precond_size += precond_size
+                    total_precond_mb += precond_mb
 
                 state["step"] += 1
 
@@ -177,10 +192,14 @@ class Kron(torch.optim.Optimizer):
                 if mu_dtype is not None:
                     momentum_buffer.to(dtype=mu_dtype, non_blocking=True, copy=False)
 
+        if total_momentum_size > 0:
+            print(f"PSGD Momentum buffer size: {total_momentum_size} elements, {total_momentum_mb:.2f} MB")
+            print(f"PSGD Preconditioners size: {total_precond_size} elements, {total_precond_mb:.2f} MB")
+
         return loss
 
     def _init_Qs_exprs(self, momentum_buffer_with_grad, group, precond_dtype):
-        Qs_exprs = [
+        return [
             init_Q_exprs(
                 m,
                 self._precond_init_scale,
@@ -191,17 +210,6 @@ class Kron(torch.optim.Optimizer):
             )
             for m in momentum_buffer_with_grad
         ]
-
-        # Print preconditioner sizes
-        Qs_n_elements = sum(sum(q.numel() for q in Q[0]) for Q in Qs_exprs)
-        Qs_size_MB = sum(
-            sum(q.numel() * q.element_size() / (2**20) for q in Q[0]) for Q in Qs_exprs
-        )
-        print(
-            f"PSGD Preconditioners size: {Qs_n_elements} elements, {Qs_size_MB:.2f} MB"
-        )
-
-        return Qs_exprs
 
 
 def norm_lower_bound(A):
