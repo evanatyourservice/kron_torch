@@ -39,7 +39,8 @@ class Kron(torch.optim.Optimizer):
         weight_decay=0.0,
         preconditioner_update_probability=None,
         max_size_triangular=8192,
-        max_skew_triangular=10,
+        max_skew_triangular=float("inf"),
+        min_ndim_triangular=2,
         mu_dtype=None,
         precond_dtype=None,
     ):
@@ -60,6 +61,7 @@ class Kron(torch.optim.Optimizer):
             preconditioner_update_probability=preconditioner_update_probability,
             max_size_triangular=max_size_triangular,
             max_skew_triangular=max_skew_triangular,
+            min_ndim_triangular=min_ndim_triangular,
             precond_lr=0.1,  # precond lr hardcoded to 0.1
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
@@ -160,6 +162,7 @@ class Kron(torch.optim.Optimizer):
                 self._precond_init_scale,
                 group["max_size_triangular"],
                 group["max_skew_triangular"],
+                group["min_ndim_triangular"],
                 dtype=precond_dtype,
             )
             for m in momentum_buffer_with_grad
@@ -242,7 +245,7 @@ def norm_lower_bound(A):
         return max_abs
 
 
-def init_Q_exprs(t, scale, max_size, max_skew, dtype=None):
+def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
     """For a scalar or tensor t, we initialize its preconditioner Q and
     reusable contraction expressions for updating Q and preconditioning gradient.
     """
@@ -280,7 +283,12 @@ def init_Q_exprs(t, scale, max_size, max_skew, dtype=None):
             "",
         )  # used for getting the subscripts for exprP
         for i, size in enumerate(shape):
-            if size == 1 or size > max_size or size > max_skew * beta_size:
+            if (
+                size == 1
+                or size > max_size
+                or size > max_skew * beta_size
+                or len(shape) < min_ndim_triangular
+            ):
                 # use diagonal matrix as preconditioner for this dim
                 Q.append(scale * torch.ones(size, dtype=dtype, device=t.device))
 

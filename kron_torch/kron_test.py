@@ -98,7 +98,7 @@ def main():
     test_dataset = datasets.MNIST("../data", train=False, transform=transform)
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=256, shuffle=True
+        train_dataset, batch_size=128, shuffle=True
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=1000, shuffle=False
@@ -118,7 +118,7 @@ def main():
         model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
     )
 
-    num_epochs = 2
+    num_epochs = 1
     steps_per_epoch = len(train_loader)
     total_steps = num_epochs * steps_per_epoch
 
