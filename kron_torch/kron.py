@@ -4,9 +4,6 @@ re-factored norm_lower_bound into greater than and less than functions that coul
             conected through torch.cond -- still mmight sub par since the full function couldnt be compiled but whatever
             it doesnt have torch.where which is nice. 
 '''
-
-from dks.examples.pytorch.modified_resnet_torch import create_resnet18
-
 import string
 import torch
 
