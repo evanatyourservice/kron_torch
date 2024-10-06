@@ -42,9 +42,8 @@ optimizer.step()
 
 **Basic hyperparameters:**
 
-TLDR: Learning rate and weight decay act similarly to adam, but lr might be able to be a little 
-higher like 0.001 -> 0.002 or 0.003, and weight decay might be best a little lower like 
-0.1 -> 0.05 or 0.03. I'd start with adam's settings and go from there. There is no b2 or epsilon.
+TLDR: Learning rate and weight decay act similarly to adam's, start with adam-like settings and go 
+from there. There is no b2 or epsilon.
 
 These next settings control whether a dimension's preconditioner is diagonal or triangular. 
 For example, for a layer with shape (256, 128), triagular preconditioners would be shapes (256, 256)
