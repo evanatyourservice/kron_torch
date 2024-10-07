@@ -1,7 +1,7 @@
-iimport string
+import string
 import torch
 
-
+import torch_tensorrt 
 torch._dynamo.config.cache_size_limit = 100_000_000
 torch._dynamo.config.capture_scalar_outputs = False
 
@@ -327,7 +327,7 @@ def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True,mode="max-autotune")
 def balance_Q(Q_in):
     norms = [torch.max(torch.abs(q)) for q in Q_in]
     geometric_mean = (torch.cumprod(torch.stack(norms), dim=0)[-1]) ** (1 / len(Q_in))
@@ -335,6 +335,8 @@ def balance_Q(Q_in):
     return new_Q
 
 
+# 
+# 
 @torch.compiler.disable
 def norm_lower_bound(A):
     """Returns a cheap lower bound for the spectral norm of A.
@@ -366,64 +368,69 @@ def norm_lower_bound(A):
         return max_abs
 
 
+# @torch.compile(fullgraph=True, mode="max-autotune")
+# def solve_triangular_right(X, A):
+#     # return X @ inv(A)
+#     if X.dim() > 1:
+#         X = X[None, :]
+#     orig_dtype = X.dtype
+#     X = X.to(dtype=torch.float32, non_blocking=True)
+#     A = A.to(dtype=torch.float32, non_blocking=True)
+#     out = torch.linalg.solve_triangular(A, X, upper=True, left=False).to(
+#         dtype=orig_dtype, non_blocking=True
+#     )
+#     if X.dim() > 1:
+#         return out[0]
+#     return out
+
+
 @torch.compile(fullgraph=True, mode="max-autotune")
 def solve_triangular_right(X, A):
     # return X @ inv(A)
     if X.dim() > 1:
         X = X[None, :]
     orig_dtype = X.dtype
-    X = X.to(dtype=torch.float32, non_blocking=True)
-    A = A.to(dtype=torch.float32, non_blocking=True)
+    device = X.device
+    X = X.to(dtype=torch.float32, device=device, non_blocking=True)
+    A = A.to(dtype=torch.float32, device=device, non_blocking=True)
     out = torch.linalg.solve_triangular(A, X, upper=True, left=False).to(
-        dtype=orig_dtype, non_blocking=True
+        dtype=orig_dtype, device=device, non_blocking=True
     )
     if X.dim() > 1:
         return out[0]
     return out
 
-
-@torch.compile
-def calc_A(Q, G, exprA):
-    return torch.einsum(exprA, *Q, G)
-
-
-@torch.compile
-def calc_conjB(V, Q, order):
+# @torch.compile(options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True},fullgraph=True)
+@torch.compile(fullgraph=True, mode="max-autotune")
+def calc_A_and_conjB(Q, G, V, exprA):
+    order = G.dim()
+    A = torch.einsum(exprA, *Q, G)
+    
     p = list(range(order))
     conjB = torch.permute(V.conj(), p[1:] + p[:1])
     for i, q in enumerate(Q):
         conjB = conjB / q if q.dim() < 2 else solve_triangular_right(conjB, q)
         if i < order - 1:
             conjB = torch.transpose(conjB, i, order - 1)
-    return conjB
+    
+    return A, conjB
 
 
-@torch.compile
-def calc_term_1_and_2(A, conjB, exprG):
-    term1 = torch.einsum(exprG, A, A.conj())
-    term2 = torch.einsum(exprG, conjB.conj(), conjB)
-    return term1, term2
-
-
-@torch.compile
-def calc_triu_q(term1, term2, q):
-    return torch.triu(term1 - term2) @ q
-
-
-# @torch.compile
+@torch.compile(backend='onnxrt')
 def update_precond_kron_math_(Q, exprs, V, G, step, tiny):
     """Update Kronecker product preconditioner Q with (vector, hess-vector-product)
     pair (V, G). V is optional, and we can set it to None if it is integrated out
     (NOT recommend).
     """
-    order = G.dim()
     exprA, exprGs, _ = exprs
 
-    A = calc_A(Q, G, exprA)
-    conjB = calc_conjB(V, Q, order)
+    # Use the combined function
+    A, conjB = calc_A_and_conjB(Q, G, V, exprA)
 
     for i, q in enumerate(Q):
-        term1, term2 = calc_term_1_and_2(A, conjB, exprGs[i])
+        # Expanded calc_term_1_and_2
+        term1 = torch.einsum(exprGs[i], A, A.conj())
+        term2 = torch.einsum(exprGs[i], conjB.conj(), conjB)
 
         if q.dim() < 2:
             q.sub_(
@@ -433,14 +440,18 @@ def update_precond_kron_math_(Q, exprs, V, G, step, tiny):
                 * q
             )
         else:
+            # Expanded calc_triu_q
+            triu_q = torch.triu(term1 - term2) @ q
+            
             q.sub_(
                 step
                 / (norm_lower_bound(term1 + term2) + tiny)
-                * calc_triu_q(term1, term2, q)
+                * triu_q
             )
 
+# @torch.compile(options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True},fullgraph=True)
 
-@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True,mode="max-autotune")
 def precond_grad_kron_math(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
     # the last expr is exprP

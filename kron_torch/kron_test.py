@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from kron import Kron
+import time
 
 
 class SimpleConvNet(nn.Module):
@@ -46,6 +47,10 @@ def print_model_summary(model):
 def train(model, device, train_loader, optimizer, scheduler, epoch):
     initial_static_param = model.static_param.clone()
     model.train()
+    start_time = time.time()
+    last_print_time = start_time
+    total_steps = 0
+    steps_since_last_print = 0
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
@@ -55,14 +60,29 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
+        total_steps += 1
+        steps_since_last_print += 1
         if batch_idx % 50 == 0:
+            current_time = time.time()
+            elapsed_time = current_time - last_print_time
+            steps_per_second = steps_since_last_print / elapsed_time
             print(
                 f"Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} "
                 f"({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}"
+                f"\tSteps/sec: {steps_per_second:.2f}"
             )
+            last_print_time = current_time
+            steps_since_last_print = 0
+
+    total_time = time.time() - start_time
+    average_steps_per_second = total_steps / total_time
+    print(f"Epoch {epoch} completed. Average steps/sec: {average_steps_per_second:.2f}")
+
     assert torch.allclose(
         model.static_param, initial_static_param
     ), "Static parameter changed during training!"
+    
+    return average_steps_per_second  # Return the average steps per second
 
 
 def test(model, device, test_loader):
@@ -98,7 +118,7 @@ def main():
     test_dataset = datasets.MNIST("../data", train=False, transform=transform)
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=128, shuffle=True
+        train_dataset, batch_size=64, shuffle=True
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=1000, shuffle=False
@@ -108,81 +128,97 @@ def main():
     model_sgd = SimpleConvNet().to(device)
     model_sgd.load_state_dict(model_kron.state_dict())
 
+    model_kron = torch.compile(model_kron)
+    model_sgd = torch.compile(model_sgd)
+
     print_model_summary(model_kron)
 
     print(f"Initial static param (Kron): {model_kron.static_param.item():.4f}")
     print(f"Initial static param (SGD): {model_sgd.static_param.item():.4f}")
 
     optimizer_kron = Kron(
-        model_kron.parameters(), lr=0.001, weight_decay=0.0001, max_skew_triangular=1
+        model_kron.parameters(), lr=0.0001, weight_decay=0.0001, max_skew_triangular=1,preconditioner_update_probability=1
     )  # should be largest dim diag, rest tri
+    
+    # Additional Kron optimizer configurations
+    optimizer_kron_no_skew = Kron(
+        model_kron.parameters(), lr=0.0001, weight_decay=0.0001,preconditioner_update_probability=1
+    )  # No max_skew_triangular setting
+
+    optimizer_kron_max_size_0 = Kron(
+        model_kron.parameters(), lr=0.0001, weight_decay=0.0001, max_skew_triangular=0,preconditioner_update_probability=1
+    )  # max_skew_triangular set to 0
     optimizer_sgd = torch.optim.SGD(
-        model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
+        model_sgd.parameters(), lr=0.001, momentum=0.9, weight_decay=0.0001
     )
 
-    num_epochs = 1
+    num_epochs = 4
     steps_per_epoch = len(train_loader)
     total_steps = num_epochs * steps_per_epoch
 
     scheduler_kron = torch.optim.lr_scheduler.LinearLR(
         optimizer_kron, start_factor=1.0, end_factor=0.0, total_iters=total_steps
     )
+    scheduler_kron_no_skew = torch.optim.lr_scheduler.LinearLR(
+        optimizer_kron_no_skew, start_factor=1.0, end_factor=0.0, total_iters=total_steps
+    )
+    scheduler_kron_max_size_0 = torch.optim.lr_scheduler.LinearLR(
+        optimizer_kron_max_size_0, start_factor=1.0, end_factor=0.0, total_iters=total_steps
+    )
     scheduler_sgd = torch.optim.lr_scheduler.LinearLR(
         optimizer_sgd, start_factor=1.0, end_factor=0.0, total_iters=total_steps
     )
 
     print("Training with Kron optimizer:")
+    kron_steps_per_second = []
     for epoch in range(1, num_epochs + 1):
-        train(model_kron, device, train_loader, optimizer_kron, scheduler_kron, epoch)
+        steps_per_second = train(model_kron, device, train_loader, optimizer_kron, scheduler_kron, epoch)
+        if epoch > 2:
+            kron_steps_per_second.append(steps_per_second)
     kron_accuracy = test(model_kron, device, test_loader)
 
-    # Updated section to print Kron optimizer states
-    print("\nKron optimizer states:")
-    for group_idx, group in enumerate(optimizer_kron.param_groups):
-        print(f"Parameter group {group_idx}:")
-        for p in group["params"]:
-            if p.requires_grad:
-                state = optimizer_kron.state[p]
-                print(f"  Parameter: shape={p.shape}, dtype={p.dtype}")
-                if state:
-                    for key, value in state.items():
-                        if key == "Q":
-                            print(f"    Q: list of {len(value)} tensors")
-                            for i, q_tensor in enumerate(value):
-                                print(
-                                    f"      Q[{i}]: shape={q_tensor.shape}, dtype={q_tensor.dtype}"
-                                )
-                        elif key == "exprs":
-                            print(f"    exprs: tuple of {len(value)} expressions")
-                        elif isinstance(value, torch.Tensor):
-                            print(
-                                f"    {key}: shape={value.shape}, dtype={value.dtype}"
-                            )
-                        else:
-                            print(f"    {key}: {type(value)}")
-                else:
-                    print("    No state")
+    print("Training with Kron optimizer (no skew setting):")
+    kron_no_skew_steps_per_second = []
+    for epoch in range(1, num_epochs + 1):
+        steps_per_second = train(model_kron, device, train_loader, optimizer_kron_no_skew, scheduler_kron_no_skew, epoch)
+        if epoch > 2:
+            kron_no_skew_steps_per_second.append(steps_per_second)
+    kron_no_skew_accuracy = test(model_kron, device, test_loader)
 
-    # Print additional optimizer attributes
-    print("\nOptimizer attributes:")
-    for attr_name in dir(optimizer_kron):
-        if not attr_name.startswith("_") and attr_name not in ["state", "param_groups"]:
-            attr_value = getattr(optimizer_kron, attr_name)
-            if not callable(attr_value):
-                if isinstance(attr_value, torch.Tensor):
-                    print(
-                        f"  {attr_name}: shape={attr_value.shape}, dtype={attr_value.dtype}"
-                    )
-                else:
-                    print(f"  {attr_name}: {type(attr_value)}")
+    print("Training with Kron optimizer (max skew triangular = 0):")
+    kron_max_size_0_steps_per_second = []
+    for epoch in range(1, num_epochs + 1):
+        steps_per_second = train(model_kron, device, train_loader, optimizer_kron_max_size_0, scheduler_kron_max_size_0, epoch)
+        if epoch > 2:
+            kron_max_size_0_steps_per_second.append(steps_per_second)
+    kron_max_size_0_accuracy = test(model_kron, device, test_loader)
 
     print("\nTraining with SGD optimizer:")
+    sgd_steps_per_second = []
     for epoch in range(1, num_epochs + 1):
-        train(model_sgd, device, train_loader, optimizer_sgd, scheduler_sgd, epoch)
+        steps_per_second = train(model_sgd, device, train_loader, optimizer_sgd, scheduler_sgd, epoch)
+        if epoch > 2:
+            sgd_steps_per_second.append(steps_per_second)
     sgd_accuracy = test(model_sgd, device, test_loader)
+
+    # Print average steps per second for each optimizer after skipping first two epochs
+    def print_avg_steps_per_second(name, steps_per_second):
+        if steps_per_second:
+            avg = sum(steps_per_second) / len(steps_per_second)
+            print(f"Average steps per second ({name}, after compiling): {avg:.2f}")
+        else:
+            print(f"Not enough epochs to calculate average steps per second for {name} optimizer")
+
+    print("\nPerformance summary:")
+    print_avg_steps_per_second("Kron", kron_steps_per_second)
+    print_avg_steps_per_second("Kron no skew", kron_no_skew_steps_per_second)
+    print_avg_steps_per_second("Kron max skew 0", kron_max_size_0_steps_per_second)
+    print_avg_steps_per_second("SGD", sgd_steps_per_second)
 
     print(f"\nFinal results:")
     print(f"Kron accuracy: {kron_accuracy:.2f}%")
+    print(f"Kron no skew accuracy: {kron_no_skew_accuracy:.2f}%")
+    print(f"Kron max skew 0 accuracy: {kron_max_size_0_accuracy:.2f}%")
     print(f"SGD accuracy: {sgd_accuracy:.2f}%")
     print(f"Scalar value (Kron): {model_kron.scalar.item():.4f}")
     print(f"Scalar value (SGD): {model_sgd.scalar.item():.4f}")
