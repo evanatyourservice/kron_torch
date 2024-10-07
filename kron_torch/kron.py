@@ -1,8 +1,8 @@
 import string
 import torch
 
+
 torch._dynamo.config.cache_size_limit = 1_000_000
-# torch.set_float32_matmul_precision('high')
 
 try:
     torch.backends.opt_einsum.strategy = 'dynamic-programming'
@@ -132,7 +132,8 @@ class Kron(torch.optim.Optimizer):
         device = self.param_groups[0]["params"][0].device
         do_update = torch.rand([], device=device) < update_prob
         self._prob_step += 1
-        balance = torch.rand([], device=device) < 0.01
+        
+        balance = torch.rand([], device=device) < 0.01 and do_update
 
         for group in self.param_groups:
             precond_dtype = group.get("precond_dtype", torch.float32)
@@ -183,7 +184,7 @@ class Kron(torch.optim.Optimizer):
                 momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
 
                 # balance preconditioners about every 100 updates
-                if grad.dim() > 1 and balance and do_update:
+                if grad.dim() > 1 and balance:
                     _balance_Q(state["Q"])
 
                 # Update preconditioner
@@ -418,5 +419,5 @@ def _update_precond(Q, exprs, V, G, step, tiny):
 @torch.compile(fullgraph=True, dynamic=False)
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
-    # the last expr is exprP
-    return torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
+    exprP = exprs[-1]
+    return torch.einsum(exprP, *[q.conj() for q in Q], *Q, G)
