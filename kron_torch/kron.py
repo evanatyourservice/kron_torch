@@ -419,5 +419,4 @@ def _update_precond(Q, exprs, V, G, step, tiny):
 @torch.compile(fullgraph=True, dynamic=False)
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
-    exprP = exprs[-1]
-    return torch.einsum(exprP, *[q.conj() for q in Q], *Q, G)
+    return torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
