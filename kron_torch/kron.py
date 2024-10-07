@@ -375,26 +375,6 @@ def norm_lower_bound(A):
 
 
 
-
-# @torch.compile(fullgraph=True, mode="max-autotune")
-# def solve_triangular_right(X, A):
-#     # return X @ inv(A)
-#     if X.dim() > 1:
-#         X = X[None, :]
-#     orig_dtype = X.dtype
-#     X = X.to(dtype=torch.float32, non_blocking=True)
-#     A = A.to(dtype=torch.float32, non_blocking=True)
-#     out = torch.linalg.solve_triangular(A, X, upper=True, left=False).to(
-#         dtype=orig_dtype, non_blocking=True
-#     )
-#     if X.dim() > 1:
-#         return out[0]
-#     return out
-
-# torch._dynamo.list_backends()
-# @torch.compile(fullgraph=True, mode="max-autotune")
-# @torch.compile(fullgraph=True, backend='cudagraphs',options={"epilogue_fusion": False,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":False})
-# @torch.compile(fullgraph=True, backend='cudagraphs',options={"epilogue_fusion": False,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":False})
 @torch.compile(fullgraph=True, backend='cudagraphs',options={"epilogue_fusion": False,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":False})
 def solve_triangular_right(X, A):
     """X @ inv(A)"""
@@ -405,7 +385,6 @@ def solve_triangular_right(X, A):
         dtype=orig_dtype, non_blocking=True
     )[0]
 
-# @torch.compile(options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True},fullgraph=True)
 @torch.compile(fullgraph=True, mode="max-autotune")
 def calc_A_and_conjB(Q, G, V, exprA):
     order = G.dim()
@@ -453,8 +432,6 @@ def update_precond_kron_math_(Q, exprs, V, G, step, tiny):
                 / (norm_lower_bound(term1 + term2) + tiny)
                 * triu_q
             )
-
-# @torch.compile(options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True},fullgraph=True)
 
 @torch.compile(fullgraph=True,backend='inductor',options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True})
 def precond_grad_kron_math(Q, exprs, G):
