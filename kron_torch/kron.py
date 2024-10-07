@@ -357,7 +357,6 @@ def _norm_lower_bound(A):
     return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
 def _solve_triangular_right(X, A):
     """X @ inv(A)"""
     orig_dtype = X.dtype
