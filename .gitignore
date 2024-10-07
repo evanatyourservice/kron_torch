@@ -168,3 +168,6 @@ wandb
 
 quadratic_fitting.png
 training_loss.png
+
+scratch
+/data
