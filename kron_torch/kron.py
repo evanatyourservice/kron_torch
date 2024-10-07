@@ -178,7 +178,7 @@ class Kron(torch.optim.Optimizer):
 
                 # balance preconditioners about every 100 precond updates
                 if grad.dim() > 1 and torch.rand([]) < 0.01 and do_update:
-                    state["Q"] = balance_Q(state["Q"])
+                    balance_Q(state["Q"])
 
                 # Update preconditioner
                 if do_update:
@@ -327,16 +327,21 @@ def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=True,mode="max-autotune")
+@torch.compile(fullgraph=True,backend='cudagraphs')
 def balance_Q(Q_in):
-    norms = [torch.max(torch.abs(q)) for q in Q_in]
-    geometric_mean = (torch.cumprod(torch.stack(norms), dim=0)[-1]) ** (1 / len(Q_in))
-    new_Q = [q.mul_(geometric_mean / norms[i]) for i, q in enumerate(Q_in)]
-    return new_Q
+    norms = torch.tensor([torch.max(torch.abs(q)) for q in Q_in])
+    geometric_mean = norms.prod() ** (1 / len(Q_in))
+    for i, q in enumerate(Q_in):
+        q.mul_(geometric_mean / norms[i])
+
+# @torch.compile(fullgraph=True,mode="max-autotune")
+# def balance_Q(Q_in):
+#     norms = [torch.max(torch.abs(q)) for q in Q_in]
+#     geometric_mean = (torch.cumprod(torch.stack(norms), dim=0)[-1]) ** (1 / len(Q_in))
+#     for i, q in enumerate(Q_in):
+#         q.mul_(geometric_mean / norms[i])
 
 
-# 
-# 
 @torch.compiler.disable
 def norm_lower_bound(A):
     """Returns a cheap lower bound for the spectral norm of A.
@@ -366,6 +371,9 @@ def norm_lower_bound(A):
             )
     else:  # must have A=0
         return max_abs
+ 
+
+
 
 
 # @torch.compile(fullgraph=True, mode="max-autotune")
@@ -383,29 +391,26 @@ def norm_lower_bound(A):
 #         return out[0]
 #     return out
 
-
-@torch.compile(fullgraph=True, mode="max-autotune")
+# torch._dynamo.list_backends()
+# @torch.compile(fullgraph=True, mode="max-autotune")
+# @torch.compile(fullgraph=True, backend='cudagraphs',options={"epilogue_fusion": False,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":False})
+# @torch.compile(fullgraph=True, backend='cudagraphs',options={"epilogue_fusion": False,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":False})
+@torch.compile(fullgraph=True, backend='cudagraphs',options={"epilogue_fusion": False,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":False})
 def solve_triangular_right(X, A):
-    # return X @ inv(A)
-    if X.dim() > 1:
-        X = X[None, :]
+    """X @ inv(A)"""
     orig_dtype = X.dtype
-    device = X.device
-    X = X.to(dtype=torch.float32, device=device, non_blocking=True)
-    A = A.to(dtype=torch.float32, device=device, non_blocking=True)
-    out = torch.linalg.solve_triangular(A, X, upper=True, left=False).to(
-        dtype=orig_dtype, device=device, non_blocking=True
-    )
-    if X.dim() > 1:
-        return out[0]
-    return out
+    X = X.to(dtype=torch.float32, non_blocking=True)
+    A = A.to(dtype=torch.float32, non_blocking=True)
+    return torch.linalg.solve_triangular(A, X[None, :], upper=True, left=False).to(
+        dtype=orig_dtype, non_blocking=True
+    )[0]
 
 # @torch.compile(options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True},fullgraph=True)
 @torch.compile(fullgraph=True, mode="max-autotune")
 def calc_A_and_conjB(Q, G, V, exprA):
     order = G.dim()
     A = torch.einsum(exprA, *Q, G)
-    
+
     p = list(range(order))
     conjB = torch.permute(V.conj(), p[1:] + p[:1])
     for i, q in enumerate(Q):
@@ -451,7 +456,7 @@ def update_precond_kron_math_(Q, exprs, V, G, step, tiny):
 
 # @torch.compile(options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True},fullgraph=True)
 
-@torch.compile(fullgraph=True,mode="max-autotune")
+@torch.compile(fullgraph=True,backend='inductor',options={"epilogue_fusion": True,"max_autotune":True,"triton.cudagraphs":True,"shape_padding":True})
 def precond_grad_kron_math(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
     # the last expr is exprP
