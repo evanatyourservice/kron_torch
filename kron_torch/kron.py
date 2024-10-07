@@ -367,7 +367,7 @@ def _solve_triangular_right(X, A):
     )[0]
 
 
-@torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
+@torch.compile(fullgraph=True, mode="reduce-overhead", dynamic=False)
 def _calc_A_and_conjB(exprA, G, Q, V):
     A = torch.einsum(exprA, *Q, G)
     order = G.dim()
