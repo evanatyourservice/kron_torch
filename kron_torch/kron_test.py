@@ -11,17 +11,17 @@ class LargerConvNet(nn.Module):
     def __init__(self):
         super(LargerConvNet, self).__init__()
         self.scalar = nn.Parameter(torch.ones(1))
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.ln1 = nn.LayerNorm([32, 28, 28])
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.ln2 = nn.LayerNorm([64, 28, 28])
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.ln3 = nn.LayerNorm([128, 14, 14])
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.ln4 = nn.LayerNorm([256, 7, 7])
-        self.fc1 = nn.Linear(256 * 7 * 7, 1024)
-        self.ln5 = nn.LayerNorm(1024)
-        self.fc2 = nn.Linear(1024, 10)
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+        self.ln1 = nn.LayerNorm([64, 28, 28])
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.ln2 = nn.LayerNorm([128, 28, 28])
+        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.ln3 = nn.LayerNorm([256, 14, 14])
+        self.conv4 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
+        self.ln4 = nn.LayerNorm([512, 7, 7])
+        self.fc1 = nn.Linear(512 * 7 * 7, 2048)
+        self.ln5 = nn.LayerNorm(2048)
+        self.fc2 = nn.Linear(2048, 10)
         self.static_param = nn.Parameter(torch.randn(1), requires_grad=False)
 
     def forward(self, x):
@@ -30,7 +30,7 @@ class LargerConvNet(nn.Module):
         x = F.relu(self.ln2(self.conv2(x)))
         x = F.relu(self.ln3(self.conv3(F.max_pool2d(x, 2))))
         x = F.relu(self.ln4(self.conv4(F.max_pool2d(x, 2))))
-        x = x.view(-1, 256 * 7 * 7)
+        x = x.view(-1, 512 * 7 * 7)
         x = F.relu(self.ln5(self.fc1(x)))
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
@@ -53,9 +53,7 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
     model.train()
     start_time = time.time()
 
-    # Determine if train_loader is a DataLoader or a list
     is_dataloader = isinstance(train_loader, torch.utils.data.DataLoader)
-    dataset_size = len(train_loader.dataset) if is_dataloader else len(train_loader)
     num_batches = len(train_loader)
 
     for batch_idx, batch in enumerate(train_loader):
@@ -64,7 +62,7 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
             if not isinstance(data, torch.Tensor):
                 data, target = data.to(device), target.to(device)
         else:
-            data, target = batch  # Data is already on the device
+            data, target = batch
 
         optimizer.zero_grad()
         output = model(data)
@@ -76,8 +74,8 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
 
         if batch_idx % 50 == 0:
             print(
-                f"Train Epoch: {epoch} [{batch_idx * len(data)}/{dataset_size} "
-                f"({100. * batch_idx / num_batches:.0f}%)]\tLoss: {loss.item():.6f}"
+                f"Epoch: {epoch}, Batch: {batch_idx + 1}/{num_batches}, "
+                f"Loss: {loss.item():.6f}"
             )
 
     epoch_time = time.time() - start_time
@@ -91,7 +89,6 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Optimize dataset loading and processing
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
     )
@@ -100,7 +97,6 @@ def main():
         "../data", train=True, download=True, transform=transform
     )
 
-    # Use num_workers for parallel data loading
     num_workers = 4
     pin_memory = True if device.type == "cuda" else False
 
@@ -112,7 +108,6 @@ def main():
         pin_memory=pin_memory,
     )
 
-    # Pre-fetch data to GPU if using CUDA
     if device.type == "cuda":
         train_data = [data.to(device) for data, _ in train_loader]
         train_targets = [target.to(device) for _, target in train_loader]
@@ -155,7 +150,6 @@ def main():
     for epoch in range(1, num_epochs + 1):
         train(model_kron, device, train_loader, optimizer_kron, scheduler_kron, epoch)
 
-    # Updated section to print Kron optimizer states
     print("\nKron optimizer states:")
     for group_idx, group in enumerate(optimizer_kron.param_groups):
         print(f"Parameter group {group_idx}:")
@@ -182,7 +176,6 @@ def main():
                 else:
                     print("    No state")
 
-    # Print additional optimizer attributes
     print("\nOptimizer attributes:")
     for attr_name in dir(optimizer_kron):
         if not attr_name.startswith("_") and attr_name not in ["state", "param_groups"]:
