@@ -3,7 +3,13 @@ import torch
 
 
 torch._dynamo.config.cache_size_limit = 1000
+# torch.set_float32_matmul_precision('high')
 
+try:
+    torch.backends.opt_einsum.strategy = 'dynamic-programming'
+except AttributeError:
+    # opt_einsum backend is not available, so we'll skip setting the strategy
+    pass
 
 def precond_update_prob_schedule(
     max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=200
@@ -350,7 +356,7 @@ def _norm_lower_bound(A):
     max_abs = torch.max(torch.abs(A))
     return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
 
-
+@torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
 def _solve_triangular_right(X, A):
     """X @ inv(A)"""
     orig_dtype = X.dtype
@@ -361,7 +367,7 @@ def _solve_triangular_right(X, A):
     )[0]
 
 
-@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
 def _calc_A_and_conjB(exprA, G, Q, V):
     A = torch.einsum(exprA, *Q, G)
     order = G.dim()
@@ -374,7 +380,7 @@ def _calc_A_and_conjB(exprA, G, Q, V):
     return A, conjB
 
 
-@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True, dynamic=False)
 def _q_terms(exprGs, A, conjB):
     terms = []
     for exprG in exprGs:
@@ -382,7 +388,6 @@ def _q_terms(exprGs, A, conjB):
         term2 = torch.einsum(exprG, conjB.conj(), conjB)
         terms.append((term1, term2))
     return terms
-
 
 def _update_precond(Q, exprs, V, G, step, tiny):
     """Update Kronecker product preconditioner Q with pair (V, G)."""
@@ -409,7 +414,7 @@ def _update_precond(Q, exprs, V, G, step, tiny):
             )
 
 
-@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True, dynamic=False)
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
     # the last expr is exprP
