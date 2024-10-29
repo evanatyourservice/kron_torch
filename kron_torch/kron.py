@@ -1,3 +1,4 @@
+import numpy as np
 import string
 import torch
 
@@ -5,14 +6,14 @@ import torch
 torch._dynamo.config.cache_size_limit = 1_000_000
 
 try:
-    torch.backends.opt_einsum.strategy = 'dynamic-programming'
+    torch.backends.opt_einsum.strategy = "dynamic-programming"
 except AttributeError:
     # opt_einsum backend is not available, so we'll skip setting the strategy
     pass
 
 
 def precond_update_prob_schedule(
-    max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=200
+    max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=250
 ):
     """Anneal preconditioner update probability during beginning of training.
 
@@ -45,21 +46,24 @@ class Kron(torch.optim.Optimizer):
     Args:
         params (iterable): Iterable of parameters to optimize or dicts defining
             parameter groups.
-        lr (float, optional): Learning rate (default: 0.001).
-        b1 (float, optional): Momentum parameter (default: 0.9).
-        weight_decay (float, optional): Weight decay (L2 penalty) (default: 0.0).
+        lr (float): Learning rate.
+        b1 (float): Momentum parameter.
+        weight_decay (float): Weight decay (L2 penalty).
         preconditioner_update_probability (callable or float, optional): Probability of
             updating the preconditioner. If None, defaults to a schedule that anneals
             from 1.0 to 0.03 by 4000 steps.
-        max_size_triangular (int, optional): Max size for dim's preconditioner to be
-            triangular (default: 8192).
-        max_skew_triangular (float, optional): Max skew for dim's preconditioner to be
-            triangular (default: inf).
-        min_ndim_triangular (int, optional): Minimum number of dimensions a layer needs
-            to have triangular preconditioners (default: 2).
-        mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator. Defaults
-            to the same dtype as the parameters.
-        precond_dtype (torch.dtype, optional): Dtype of the preconditioner (default: None).
+        max_size_triangular (int): Max size for dim's preconditioner to be triangular.
+        min_ndim_triangular (int): Minimum number of dimensions a layer needs
+            to have triangular preconditioners.
+        memory_save_mode: (string, optional), None, 'one_diag', or 'all_diag', None is default
+            to set all preconditioners to be triangular, 'one_diag' sets the largest
+            or last dim to be diagonal per layer, and 'all_diag' sets all preconditioners
+            to be diagonal.
+        mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator.
+        precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
+        trust_region_scale (float): Trust region on preconditioned grads. Normally this
+            doesn't need to be changed but if things seem unstable you can try reducing
+            this to 1.5.
     """
 
     def __init__(
@@ -70,10 +74,11 @@ class Kron(torch.optim.Optimizer):
         weight_decay=0.0,
         preconditioner_update_probability=None,
         max_size_triangular=8192,
-        max_skew_triangular=float("inf"),
         min_ndim_triangular=2,
+        memory_save_mode=None,
         mu_dtype=None,
         precond_dtype=None,
+        trust_region_scale=2.0,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -91,26 +96,17 @@ class Kron(torch.optim.Optimizer):
             weight_decay=weight_decay,
             preconditioner_update_probability=preconditioner_update_probability,
             max_size_triangular=max_size_triangular,
-            max_skew_triangular=max_skew_triangular,
             min_ndim_triangular=min_ndim_triangular,
+            memory_save_mode=memory_save_mode,
             precond_lr=0.1,  # precond lr hardcoded to 0.1
             precond_init_scale=1.0,  # precond init scale hardcoded to 1.0
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
+            trust_region_scale=trust_region_scale,
         )
         super(Kron, self).__init__(params, defaults)
 
-        self._global_clip = (
-            sum(
-                p.numel()
-                for group in self.param_groups
-                for p in group["params"]
-                if p.requires_grad
-            )
-            ** 0.5
-        )
-        self._element_clip = 1.0
-        self._tiny = 1e-30
+        self._tiny = torch.finfo(torch.bfloat16).tiny
         self._prob_step = 0
 
     @torch.no_grad()
@@ -132,7 +128,7 @@ class Kron(torch.optim.Optimizer):
         device = self.param_groups[0]["params"][0].device
         do_update = torch.rand([], device=device) < update_prob
         self._prob_step += 1
-        
+
         balance = torch.rand([], device=device) < 0.01 and do_update
 
         for group in self.param_groups:
@@ -155,8 +151,8 @@ class Kron(torch.optim.Optimizer):
                         p,
                         group["precond_init_scale"],
                         group["max_size_triangular"],
-                        group["max_skew_triangular"],
                         group["min_ndim_triangular"],
+                        group["memory_save_mode"],
                         dtype=precond_dtype,
                     )
 
@@ -206,8 +202,10 @@ class Kron(torch.optim.Optimizer):
                 ).to(dtype=p.dtype, non_blocking=True)
 
                 # Apply trust region
-                torch.nn.utils.clip_grad_norm_(pre_grad, self._global_clip)
-                pre_grad.clamp_(-self._element_clip, self._element_clip)
+                pre_grad = (
+                    torch.tanh(pre_grad / group["trust_region_scale"])
+                    * group["trust_region_scale"]
+                )
 
                 # Apply weight decay and update parameters
                 if group["weight_decay"] != 0 and p.dim() >= 2:
@@ -231,7 +229,7 @@ class Kron(torch.optim.Optimizer):
         return loss
 
 
-def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
+def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtype=None):
     """For a scalar or tensor t, we initialize its preconditioner Q and
     reusable einsum expressions for updating Q and preconditioning gradient.
     """
@@ -242,8 +240,8 @@ def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
     if len(shape) == 0:  # scalar
         Q = [scale * torch.ones_like(t, dtype=dtype)]
         exprA = ",->,"
-        exprP = ",,->,"
         exprGs = [",->"]
+        exprP = ",,->,"
     else:  # tensor
         if len(shape) > 13:
             raise ValueError(
@@ -251,21 +249,31 @@ def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
             )
 
         scale = scale ** (1 / len(shape))
-        if len(shape) == 1:
-            beta_size = 1  # 2nd largest size
+
+        if memory_save_mode is None:
+            dim_diag = [False for _ in shape]
+        elif memory_save_mode == "one_diag":
+            rev_sorted_dims = np.argsort(shape)[::-1]
+            dim_diag = [False for _ in shape]
+            dim_diag[rev_sorted_dims[0]] = True
+        elif memory_save_mode == "all_diag":
+            dim_diag = [True for _ in shape]
         else:
-            beta_size = sorted(list(shape))[-2]
+            raise ValueError(
+                f"Invalid memory_save_mode: {memory_save_mode}, must be one of "
+                "[None, 'one_diag', 'all_diag']"
+            )
 
         Q = []
-        exprGs = []
         piece1A, piece2A, piece3A = ([], "", "")
+        exprGs = []
         piece1P, piece2P, piece3P, piece4P = ([], [], "", "")
-        for i, size in enumerate(shape):
+        for i, (size, dim_d) in enumerate(zip(shape, dim_diag)):
             if (
                 size == 1
                 or size > max_size
-                or size > max_skew * beta_size
                 or len(shape) < min_ndim_triangular
+                or dim_d
             ):
                 # use diagonal matrix as preconditioner for this dim
                 Q.append(scale * torch.ones(size, dtype=dtype, device=t.device))
@@ -274,19 +282,19 @@ def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
                 piece2A = piece2A + letters[i]
                 piece3A = piece3A + letters[i]
 
-                piece1P.append(letters[i + 13])
-                piece2P.append(letters[i + 13])
-                piece3P = piece3P + letters[i + 13]
-                piece4P = piece4P + letters[i + 13]
-
                 piece1 = "".join(
                     [
-                        (letters[j + 13] if j == i else letters[j])
+                        (letters[i + 13] if j == i else letters[j])
                         for j in range(len(shape))
                     ]
                 )
                 subscripts = piece1 + "," + piece1 + "->" + letters[i + 13]
                 exprGs.append(subscripts)
+
+                piece1P.append(letters[i + 13])
+                piece2P.append(letters[i + 13])
+                piece3P = piece3P + letters[i + 13]
+                piece4P = piece4P + letters[i + 13]
             else:
                 # use triangular matrix as preconditioner for this dim
                 Q.append(scale * torch.eye(size, dtype=dtype, device=t.device))
@@ -295,21 +303,15 @@ def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
                 piece2A = piece2A + letters[i + 13]
                 piece3A = piece3A + letters[i]
 
-                a, b, c = (letters[i], letters[i + 13], letters[i + 26])
-                piece1P.append(a + b)
-                piece2P.append(a + c)
-                piece3P = piece3P + c
-                piece4P = piece4P + b
-
                 piece1 = "".join(
                     [
-                        (letters[j + 13] if j == i else letters[j])
+                        (letters[i + 13] if j == i else letters[j])
                         for j in range(len(shape))
                     ]
                 )
                 piece2 = "".join(
                     [
-                        (letters[j + 26] if j == i else letters[j])
+                        (letters[i + 26] if j == i else letters[j])
                         for j in range(len(shape))
                     ]
                 )
@@ -317,6 +319,12 @@ def init_Q_exprs(t, scale, max_size, max_skew, min_ndim_triangular, dtype=None):
                     piece1 + "," + piece2 + "->" + letters[i + 13] + letters[i + 26]
                 )
                 exprGs.append(subscripts)
+
+                a, b, c = (letters[i], letters[i + 13], letters[i + 26])
+                piece1P.append(a + b)
+                piece2P.append(a + c)
+                piece3P = piece3P + c
+                piece4P = piece4P + b
 
         exprA = ",".join(piece1A) + "," + piece2A + "->" + piece3A
         exprP = (

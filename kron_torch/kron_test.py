@@ -7,21 +7,21 @@ import time
 from kron_torch import Kron
 
 
-class LargerConvNet(nn.Module):
+class ConvNet(nn.Module):
     def __init__(self):
-        super(LargerConvNet, self).__init__()
+        super(ConvNet, self).__init__()
         self.scalar = nn.Parameter(torch.ones(1))
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, padding=1)
-        self.ln1 = nn.LayerNorm([64, 28, 28])
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.ln2 = nn.LayerNorm([128, 28, 28])
-        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.ln3 = nn.LayerNorm([256, 14, 14])
-        self.conv4 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
-        self.ln4 = nn.LayerNorm([512, 7, 7])
-        self.fc1 = nn.Linear(512 * 7 * 7, 2048)
-        self.ln5 = nn.LayerNorm(2048)
-        self.fc2 = nn.Linear(2048, 10)
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.ln1 = nn.LayerNorm([16, 28, 28])
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.ln2 = nn.LayerNorm([32, 28, 28])
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.ln3 = nn.LayerNorm([64, 14, 14])
+        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.ln4 = nn.LayerNorm([128, 7, 7])
+        self.fc1 = nn.Linear(128 * 7 * 7, 128)
+        self.ln5 = nn.LayerNorm(128)
+        self.fc2 = nn.Linear(128, 10)
         self.static_param = nn.Parameter(torch.randn(1), requires_grad=False)
 
     def forward(self, x):
@@ -30,7 +30,7 @@ class LargerConvNet(nn.Module):
         x = F.relu(self.ln2(self.conv2(x)))
         x = F.relu(self.ln3(self.conv3(F.max_pool2d(x, 2))))
         x = F.relu(self.ln4(self.conv4(F.max_pool2d(x, 2))))
-        x = x.view(-1, 512 * 7 * 7)
+        x = x.view(-1, 128 * 7 * 7)
         x = F.relu(self.ln5(self.fc1(x)))
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
@@ -53,16 +53,10 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
     model.train()
     start_time = time.time()
 
-    is_dataloader = isinstance(train_loader, torch.utils.data.DataLoader)
     num_batches = len(train_loader)
 
-    for batch_idx, batch in enumerate(train_loader):
-        if is_dataloader:
-            data, target = batch
-            if not isinstance(data, torch.Tensor):
-                data, target = data.to(device), target.to(device)
-        else:
-            data, target = batch
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
 
         optimizer.zero_grad()
         output = model(data)
@@ -72,7 +66,7 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
         optimizer.step()
         scheduler.step()
 
-        if batch_idx % 50 == 0:
+        if batch_idx % 5 == 0:
             print(
                 f"Epoch: {epoch}, Batch: {batch_idx + 1}/{num_batches}, "
                 f"Loss: {loss.item():.6f}"
@@ -88,6 +82,14 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    if device.type == "cuda":
+        num_workers = 4
+        pin_memory = True
+    else:
+        num_workers = 0  # Use 0 workers for CPU to avoid overhead
+        pin_memory = False
 
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
@@ -97,28 +99,25 @@ def main():
         "../data", train=True, download=True, transform=transform
     )
 
-    num_workers = 4
-    pin_memory = True if device.type == "cuda" else False
-
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=128,
+        batch_size=8,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
 
-    if device.type == "cuda":
-        train_data = [data.to(device) for data, _ in train_loader]
-        train_targets = [target.to(device) for _, target in train_loader]
-        train_loader = list(zip(train_data, train_targets))
-
-    model_kron = LargerConvNet().to(device)
-    model_sgd = LargerConvNet().to(device)
+    model_kron = ConvNet().to(device)
+    model_sgd = ConvNet().to(device)
     model_sgd.load_state_dict(model_kron.state_dict())
 
-    model_kron = torch.compile(model_kron)
-    model_sgd = torch.compile(model_sgd)
+    if hasattr(torch, "compile"):
+        try:
+            model_kron = torch.compile(model_kron)
+            model_sgd = torch.compile(model_sgd)
+            print("Using compiled models")
+        except Exception as e:
+            print(f"Model compilation not supported on this system: {e}")
 
     print_model_summary(model_kron)
 
@@ -127,9 +126,10 @@ def main():
 
     optimizer_kron = Kron(
         model_kron.parameters(),
-        lr=0.001,
-        weight_decay=0.0001,
+        lr=0.0001,
+        weight_decay=1e-6,
         preconditioner_update_probability=1.0,
+        memory_save_mode="one_diag",
     )
     optimizer_sgd = torch.optim.SGD(
         model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
