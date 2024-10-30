@@ -44,7 +44,7 @@ optimizer.step()
 **Basic hyperparameters:**
 
 TLDR: Learning rate and weight decay act similarly to adam's, start with adam-like settings and go 
-from there. There is no b2 or epsilon.
+from there. Maybe use slightly lower learning rate (like /2). There is no b2 or epsilon.
 
 These next 3 settings control whether a dimension's preconditioner is diagonal or triangular. 
 For example, for a layer with shape (256, 128), triagular preconditioners would be shapes (256, 256)
@@ -62,14 +62,19 @@ preconditioners.
 preconditioners be triangular. 'one_diag' sets the largest or last dim per layer as diagonal 
 using `np.argsort(shape)[::-1][0]`. 'all_diag' sets all preconditioners to be diagonal.
 
+`trust_region_scale`: If you have a hunch that your problem is prone to divergence or touchy, or you are 
+training a very large model, you might want to go ahead and reduce this to `1.5`. It changes the direction
+of the update slightly, but can give much more stability for experiments prone to divergence.
+
 `preconditioner_update_probability`: Preconditioner update probability uses a schedule by default 
 that works well for most cases. It anneals from 1 to 0.03 at the beginning of training, so training 
 will be slightly slower at the start but will speed up by around 4k steps. PSGD generally benefits
 from more preconditioner updates at the start of training, but once the preconditioner is learned 
-it's okay to do them less often. An easy way to adjust update frequency is to adjust `min_prob` 
-from `precond_update_prob_schedule`.
+it's okay to do them less often. An easy way to adjust update frequency is to define your own schedule
+using the `precond_update_prob_schedule` function in kron.py (just changing the `min_prob` value 
+is easiest) and pass this into kron through the `preconditioner_update_probability` hyperparameter.
 
-This is the default schedule from the `precond_update_prob_schedule` function at the top of kron.py:
+This is the default schedule defined in the `precond_update_prob_schedule` function at the top of kron.py:
 
 <img src="assets/default_schedule.png" alt="Default Schedule" width="800" style="max-width: 100%; height: auto;" />
 
