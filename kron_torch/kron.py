@@ -239,9 +239,9 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
     shape = t.shape
     if len(shape) == 0:  # scalar
         Q = [scale * torch.ones_like(t, dtype=dtype)]
-        exprA = ",->,"
+        exprA = ",->"
         exprGs = [",->"]
-        exprP = ",,->,"
+        exprP = ",,->"
     else:  # tensor
         if len(shape) > 13:
             raise ValueError(
