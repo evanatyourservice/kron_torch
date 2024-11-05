@@ -211,7 +211,7 @@ class Kron(torch.optim.Optimizer):
                     group['weight_decay'],
                     group['lr'],
                     group['warmup_steps'],
-                    group['step']
+                    state['step']
                 )
 
                 # Restore momentum dtype
