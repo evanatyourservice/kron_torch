@@ -12,7 +12,8 @@ except AttributeError:
     # opt_einsum backend is not available, so we'll skip setting the strategy
     pass
 
-_mode = "default"
+_compile_mode = "default"
+_dynamic_mode = True
 
 
 def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=250):
@@ -256,7 +257,7 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=False, mode=_mode)
+@torch.compile(fullgraph=False, mode=_compile_mode)
 def grouped_fn(Q, exprs, momentum_buffer, precond_lr, trust_region_scale, weight_decay, lr, warmup_steps, step, balance,
                do_update):
     if momentum_buffer.dim() > 1 and balance:
@@ -266,7 +267,7 @@ def grouped_fn(Q, exprs, momentum_buffer, precond_lr, trust_region_scale, weight
     _epilogue(momentum_buffer, Q, exprs, momentum_buffer, trust_region_scale, weight_decay, lr, warmup_steps, step)
 
 
-@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
+@torch.compile(fullgraph=True, dynamic=_dynamic_mode, mode=_compile_mode)
 def _balance_Q(Q_in):
     norms = torch.stack([q.norm(float('inf')) for q in Q_in])
     geometric_mean = norms.log().mean().exp()
@@ -318,7 +319,7 @@ def _solve_triangular_right(X, A):
     return out[0]
 
 
-@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
+@torch.compile(fullgraph=True, dynamic=_dynamic_mode, mode=_compile_mode)
 def _calc_A_and_conjB(exprA, G, Q, V):
     A = torch.einsum(exprA, *Q, G)
     order = G.dim()
@@ -334,7 +335,7 @@ def _calc_A_and_conjB(exprA, G, Q, V):
     return A, conjB
 
 
-@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
+@torch.compile(fullgraph=True, dynamic=_dynamic_mode, mode=_compile_mode)
 def _q_terms(exprGs, A, conjB):
     terms = []
     for exprG in exprGs:
@@ -368,7 +369,7 @@ def _update_precond(Q, exprs, G, step):
             q.sub_(tmp)
 
 
-@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
+@torch.compile(fullgraph=True, dynamic=_dynamic_mode, mode=_compile_mode)
 def _epilogue(p, Q, exprs, G, trust_region_scale, weight_decay, lr, warmup_steps, step):
     """Precondition gradient G with preconditioner Q."""
     grad = torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
