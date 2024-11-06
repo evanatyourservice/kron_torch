@@ -286,7 +286,8 @@ def _lb(A, max_abs):
     x = torch.where(comp, A[:, i], A[j])
     x = x.conj()
     at = torch.where(comp, A, A.T)
-    x = torch.where(comp, x, x.T)
+    if x.dim() > 1:
+        x = torch.where(comp, x, x.T)
     x = x @ at
     x /= torch.linalg.vector_norm(x)
     x = x @ torch.where(comp, ah, ah.T)
