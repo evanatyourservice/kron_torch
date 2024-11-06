@@ -282,9 +282,14 @@ def _lb(A, max_abs):
     value1, j = torch.max(torch.sum(aa, dim=1), 0)
 
     ah = A.H
-    x = torch.where(value0 > value1, A[:, i].conj() @ A, A @ A[j].conj())
+    comp = value0 > value1
+    x = torch.where(comp, A[:, i], A[j])
+    x = x.conj()
+    at = torch.where(comp, A, A.T)
+    x = torch.where(comp, x, x.T)
+    x = x @ at
     x /= torch.linalg.vector_norm(x)
-    x = torch.where(value0 > value1, x @ ah, ah @ x)
+    x = x @ torch.where(comp, ah, ah.T)
     x = torch.linalg.vector_norm(x)
     x *= max_abs
     return x
