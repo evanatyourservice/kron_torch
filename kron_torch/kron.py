@@ -341,7 +341,7 @@ def _q_terms(exprGs, A, conjB):
 
 
 def _update_precond(Q, exprs, G, step):
-    eps = torch.finfo(torch.bfloat16).tiny
+    tiny = torch.finfo(torch.bfloat16).tiny
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     exprA, exprGs, _ = exprs
     V = torch.randn_like(G, dtype=G.dtype)
@@ -355,11 +355,11 @@ def _update_precond(Q, exprs, G, step):
         tmp *= step
         if q.dim() < 2:
             tmp *= q
-            tmp /= (term1 + term2).norm(float('inf')) + eps
+            tmp /= (term1 + term2).norm(float('inf')) + tiny
             q.sub_(tmp)
         else:
             tmp = torch.triu(tmp)
-            tmp /= _norm_lower_bound(term1 + term2) + eps
+            tmp /= _norm_lower_bound(term1 + term2) + tiny
             tmp @= q
             q.sub_(tmp)
 
