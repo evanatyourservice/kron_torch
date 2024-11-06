@@ -12,6 +12,8 @@ except AttributeError:
     # opt_einsum backend is not available, so we'll skip setting the strategy
     pass
 
+_mode = "default"
+
 
 def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=250):
     """Anneal preconditioner update probability during beginning of training.
@@ -29,7 +31,7 @@ def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_
         """Exponential anneal with flat start."""
         n = torch.tensor(n, dtype=torch.float32)
         prob = torch.minimum(torch.maximum(max_prob * torch.exp(-decay * (n - flat_start)), torch.tensor(min_prob)),
-            torch.tensor(max_prob), )
+                             torch.tensor(max_prob), )
         return prob
 
     return _schedule
@@ -62,8 +64,8 @@ class Kron(torch.optim.Optimizer):
     """
 
     def __init__(self, params, lr=0.001, b1=0.9, weight_decay=0.0, preconditioner_update_probability=0.5,
-            max_size_triangular=2048, min_ndim_triangular=2, memory_save_mode=None, mu_dtype=None, precond_dtype=None,
-            trust_region_scale=2.0, warmup_steps=0, ):
+                 max_size_triangular=2048, min_ndim_triangular=2, memory_save_mode=None, mu_dtype=None,
+                 precond_dtype=None, trust_region_scale=2.0, warmup_steps=0, efficient: bool = False):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= b1 < 1.0:
@@ -75,12 +77,12 @@ class Kron(torch.optim.Optimizer):
             preconditioner_update_probability = precond_update_prob_schedule()
 
         defaults = dict(lr=lr, b1=b1, weight_decay=weight_decay,
-            preconditioner_update_probability=preconditioner_update_probability,
-            max_size_triangular=max_size_triangular, min_ndim_triangular=min_ndim_triangular,
-            memory_save_mode=memory_save_mode, precond_lr=0.1,  # precond lr hardcoded to 0.1
-            precond_init_scale=1.0,  # precond init scale hardcoded to 1.0
-            mu_dtype=mu_dtype, precond_dtype=precond_dtype, trust_region_scale=trust_region_scale,
-            warmup_steps=warmup_steps, )
+                        preconditioner_update_probability=preconditioner_update_probability,
+                        max_size_triangular=max_size_triangular, min_ndim_triangular=min_ndim_triangular,
+                        memory_save_mode=memory_save_mode, precond_lr=0.1,  # precond lr hardcoded to 0.1
+                        precond_init_scale=1.0,  # precond init scale hardcoded to 1.0
+                        mu_dtype=mu_dtype, precond_dtype=precond_dtype, trust_region_scale=trust_region_scale,
+                        warmup_steps=warmup_steps, efficient=efficient)
         super(Kron, self).__init__(params, defaults)
 
         self._tiny = torch.finfo(torch.bfloat16).tiny
@@ -123,8 +125,9 @@ class Kron(torch.optim.Optimizer):
                     state["step"] = 0
                     state["momentum_buffer"] = torch.zeros_like(p, dtype=mu_dtype or p.dtype)
                     state["Q"], state["exprs"] = init_Q_exprs(p, group["precond_init_scale"],
-                        group["max_size_triangular"], group["min_ndim_triangular"], group["memory_save_mode"],
-                        dtype=precond_dtype, )
+                                                              group["max_size_triangular"],
+                                                              group["min_ndim_triangular"], group["memory_save_mode"],
+                                                              dtype=precond_dtype, )
 
                     # Print sizes
                     momentum_size = state["momentum_buffer"].numel()
@@ -146,6 +149,13 @@ class Kron(torch.optim.Optimizer):
 
                 momentum_buffer = state["momentum_buffer"]
                 momentum_buffer.lerp_(grad, debiased)
+                momentum_buffer = momentum_buffer.to(dtype=precond_dtype, non_blocking=True)
+
+                if group['efficient']:
+                    grouped_fn(state["Q"], state["exprs"], momentum_buffer.to(dtype=precond_dtype, non_blocking=True),
+                               group["precond_lr"], group["trust_region_scale"], group['weight_decay'], group['lr'],
+                               group['warmup_steps'], state['step'], balance, do_update)
+                    continue
 
                 # balance preconditioners about every 100 updates
                 if grad.dim() > 1 and balance:
@@ -153,17 +163,11 @@ class Kron(torch.optim.Optimizer):
 
                 # Update preconditioner
                 if do_update:
-                    _update_precond(state["Q"], state["exprs"],
-                        momentum_buffer.to(dtype=precond_dtype, non_blocking=True), group["precond_lr"], self._tiny, )
+                    _update_precond(state["Q"], state["exprs"], momentum_buffer, group["precond_lr"])
 
                 # Precondition gradients
-                _epilogue(p, state["Q"], state["exprs"], momentum_buffer.to(dtype=precond_dtype, non_blocking=True),
-                    group["trust_region_scale"], group['weight_decay'], group['lr'], group['warmup_steps'],
-                    state['step'])
-
-                # Restore momentum dtype
-                if mu_dtype is not None:
-                    momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
+                _epilogue(p, state["Q"], state["exprs"], momentum_buffer, group["trust_region_scale"],
+                          group['weight_decay'], group['lr'], group['warmup_steps'], state['step'])
 
         if total_momentum_size > 0:
             print(f"PSGD Momentum buffer size: {total_momentum_size} "
@@ -252,12 +256,23 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=True, mode='max-autotune')
+@torch.compile(fullgraph=False, mode=_mode)
+def grouped_fn(Q, exprs, momentum_buffer, precond_lr, trust_region_scale, weight_decay, lr, warmup_steps, step, balance,
+               do_update):
+    if momentum_buffer.dim() > 1 and balance:
+        _balance_Q(Q)
+    if do_update:
+        _update_precond(Q, exprs, momentum_buffer, precond_lr)
+    _epilogue(momentum_buffer, Q, exprs, momentum_buffer, trust_region_scale, weight_decay, lr, warmup_steps, step)
+
+
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _balance_Q(Q_in):
-    norms = torch.stack([torch.max(torch.abs(q)) for q in Q_in])
-    geometric_mean = norms.prod() ** (1 / len(Q_in))
+    norms = torch.stack([q.norm(float('inf')) for q in Q_in])
+    geometric_mean = norms.log().mean().exp()
+    norms = geometric_mean / norms
     for i, q in enumerate(Q_in):
-        q.mul_(geometric_mean / norms[i])
+        q.mul_(norms[i])
 
 
 def _lb(A, max_abs):
@@ -265,10 +280,17 @@ def _lb(A, max_abs):
     aa = torch.real(A * A.conj())
     value0, i = torch.max(torch.sum(aa, dim=0), 0)
     value1, j = torch.max(torch.sum(aa, dim=1), 0)
+
     ah = A.H
-    x = torch.cond(value0 > value1, lambda: A[:, i].conj() @ A, lambda: A @ A[j].conj())
+    comp = value0 > value1
+    x = torch.where(comp, A[:, i], A[j])
+    x = x.conj()
+    at = torch.where(comp, A, A.T)
+    if x.dim() > 1:
+        x = torch.where(comp, x, x.T)
+    x = x @ at
     x /= torch.linalg.vector_norm(x)
-    x = torch.cond(value0 > value1, lambda: x @ ah, lambda: ah @ x)
+    x = x @ torch.where(comp, ah, ah.T)
     x = torch.linalg.vector_norm(x)
     x *= max_abs
     return x
@@ -276,19 +298,23 @@ def _lb(A, max_abs):
 
 def _norm_lower_bound(A):
     """Cheap lower bound for the spectral norm of A."""
-    max_abs = torch.max(torch.abs(A))
-    return torch.cond(max_abs > 0, lambda: _lb(A, max_abs), lambda: max_abs)
+    max_abs = A.norm(float('inf'))
+    return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
+
 
 
 def _solve_triangular_right(X, A):
     """X @ inv(A)"""
-    orig_dtype = X.dtype
-    X = X.to(dtype=torch.float32, non_blocking=True)
-    A = A.to(dtype=torch.float32, non_blocking=True)
-    return torch.linalg.solve_triangular(A, X[None, :], upper=True, left=False).to(dtype=orig_dtype, non_blocking=True)[
-        0]
+    unsqueeze = X.dim() == 1
+    if unsqueeze:
+        X = X.unsqueeze(0)
+    out = torch.linalg.solve_triangular(A, X, upper=True, left=False)
+    if not unsqueeze:
+        return out
+    return out[0]
 
 
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _calc_A_and_conjB(exprA, G, Q, V):
     A = torch.einsum(exprA, *Q, G)
     order = G.dim()
@@ -296,7 +322,7 @@ def _calc_A_and_conjB(exprA, G, Q, V):
     conjB = torch.permute(V.conj(), p[1:] + p[:1])
     for i, q in enumerate(Q):
         if q.dim() < 2:
-            conjB /= q
+            conjB = conjB / q
         else:
             conjB = _solve_triangular_right(conjB, q)
         if i < order - 1:
@@ -304,6 +330,7 @@ def _calc_A_and_conjB(exprA, G, Q, V):
     return A, conjB
 
 
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _q_terms(exprGs, A, conjB):
     terms = []
     for exprG in exprGs:
@@ -313,8 +340,8 @@ def _q_terms(exprGs, A, conjB):
     return terms
 
 
-@torch.compile(fullgraph=True, mode='max-autotune')
-def _update_precond(Q, exprs, G, step, tiny):
+def _update_precond(Q, exprs, G, step):
+    eps = torch.finfo(torch.bfloat16).tiny
     """Update Kronecker product preconditioner Q with pair (V, G)."""
     exprA, exprGs, _ = exprs
     V = torch.randn_like(G, dtype=G.dtype)
@@ -328,16 +355,16 @@ def _update_precond(Q, exprs, G, step, tiny):
         tmp *= step
         if q.dim() < 2:
             tmp *= q
-            tmp /= torch.max(torch.abs(term1 + term2)) + tiny
+            tmp /= (term1 + term2).norm(float('inf')) + eps
             q.sub_(tmp)
         else:
             tmp = torch.triu(tmp)
-            tmp /= _norm_lower_bound(term1 + term2) + tiny
+            tmp /= _norm_lower_bound(term1 + term2) + eps
             tmp @= q
             q.sub_(tmp)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _epilogue(p, Q, exprs, G, trust_region_scale, weight_decay, lr, warmup_steps, step):
     """Precondition gradient G with preconditioner Q."""
     grad = torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
