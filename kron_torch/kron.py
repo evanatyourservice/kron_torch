@@ -3,15 +3,16 @@ import string
 
 import numpy as np
 import torch
-from torch.onnx.symbolic_opset9 import unsqueeze
 
 torch._dynamo.config.cache_size_limit = 1_000_000
-torch._dynamo.config.capture_scalar_outputs = True
+
 try:
     torch.backends.opt_einsum.strategy = "dynamic-programming"
 except AttributeError:
     # opt_einsum backend is not available, so we'll skip setting the strategy
     pass
+
+_mode = "default"
 
 
 def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=250):
@@ -152,8 +153,8 @@ class Kron(torch.optim.Optimizer):
 
                 if group['efficient']:
                     grouped_fn(state["Q"], state["exprs"], momentum_buffer.to(dtype=precond_dtype, non_blocking=True),
-                                 group["precond_lr"], group["trust_region_scale"], group['weight_decay'], group['lr'],
-                                 group['warmup_steps'], state['step'], balance, do_update)
+                               group["precond_lr"], group["trust_region_scale"], group['weight_decay'], group['lr'],
+                               group['warmup_steps'], state['step'], balance, do_update)
                     continue
 
                 # balance preconditioners about every 100 updates
@@ -166,8 +167,7 @@ class Kron(torch.optim.Optimizer):
 
                 # Precondition gradients
                 _epilogue(p, state["Q"], state["exprs"], momentum_buffer, group["trust_region_scale"],
-                          group['weight_decay'], group['lr'], group['warmup_steps'],
-                          state['step'])
+                          group['weight_decay'], group['lr'], group['warmup_steps'], state['step'])
 
         if total_momentum_size > 0:
             print(f"PSGD Momentum buffer size: {total_momentum_size} "
@@ -256,7 +256,7 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=False, mode='max-autotune')
+@torch.compile(fullgraph=False, mode=_mode)
 def grouped_fn(Q, exprs, momentum_buffer, precond_lr, trust_region_scale, weight_decay, lr, warmup_steps, step, balance,
                do_update):
     if momentum_buffer.dim() > 1 and balance:
@@ -266,7 +266,7 @@ def grouped_fn(Q, exprs, momentum_buffer, precond_lr, trust_region_scale, weight
     _epilogue(momentum_buffer, Q, exprs, momentum_buffer, trust_region_scale, weight_decay, lr, warmup_steps, step)
 
 
-@torch.compile(fullgraph=True, mode='max-autotune')
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _balance_Q(Q_in):
     norms = torch.stack([q.norm(float('inf')) for q in Q_in])
     geometric_mean = norms.log().mean().exp()
@@ -282,16 +282,10 @@ def _lb(A, max_abs):
     value1, j = torch.max(torch.sum(aa, dim=1), 0)
 
     ah = A.H
-    if value0 > value1:
-        x = A[:, i].conj() @ A
-        x /= torch.linalg.vector_norm(x)
-        x @= ah
-        x = torch.linalg.vector_norm(x)
-    else:
-        x = A @ A[j].conj()
-        x /= torch.linalg.vector_norm(x)
-        x = ah @ x
-        x = torch.linalg.vector_norm(x)
+    x = torch.where(value0 > value1, A[:, i].conj() @ A, A @ A[j].conj())
+    x /= torch.linalg.vector_norm(x)
+    x = torch.where(value0 > value1, x @ ah, ah @ x)
+    x = torch.linalg.vector_norm(x)
     x *= max_abs
     return x
 
@@ -299,9 +293,8 @@ def _lb(A, max_abs):
 def _norm_lower_bound(A):
     """Cheap lower bound for the spectral norm of A."""
     max_abs = A.norm(float('inf'))
-    if max_abs == 0:
-        return max_abs
-    return _lb(A, max_abs)
+    return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
+
 
 
 def _solve_triangular_right(X, A):
@@ -314,7 +307,8 @@ def _solve_triangular_right(X, A):
         return out
     return out[0]
 
-@torch.compile(fullgraph=True)
+
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _calc_A_and_conjB(exprA, G, Q, V):
     A = torch.einsum(exprA, *Q, G)
     order = G.dim()
@@ -330,6 +324,7 @@ def _calc_A_and_conjB(exprA, G, Q, V):
     return A, conjB
 
 
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _q_terms(exprGs, A, conjB):
     terms = []
     for exprG in exprGs:
@@ -363,7 +358,7 @@ def _update_precond(Q, exprs, G, step):
             q.sub_(tmp)
 
 
-@torch.compile(fullgraph=True, dynamic=False, mode='max-autotune')
+@torch.compile(fullgraph=True, dynamic=True, mode=_mode)
 def _epilogue(p, Q, exprs, G, trust_region_scale, weight_decay, lr, warmup_steps, step):
     """Precondition gradient G with preconditioner Q."""
     grad = torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
