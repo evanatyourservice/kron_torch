@@ -302,13 +302,17 @@ def _norm_lower_bound(A):
     return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
 
 
-
 def _solve_triangular_right(X, A):
     """X @ inv(A)"""
+    orig_dtype = X.dtype
+    X = X.to(dtype=torch.float32, non_blocking=True)
+    A = A.to(dtype=torch.float32, non_blocking=True)    
     unsqueeze = X.dim() == 1
     if unsqueeze:
         X = X.unsqueeze(0)
-    out = torch.linalg.solve_triangular(A, X, upper=True, left=False)
+    out = torch.linalg.solve_triangular(A, X, upper=True, left=False).to(
+        dtype=orig_dtype, non_blocking=True
+    )
     if not unsqueeze:
         return out
     return out[0]
