@@ -62,10 +62,6 @@ preconditioners.
 preconditioners be triangular. 'one_diag' sets the largest or last dim per layer as diagonal 
 using `np.argsort(shape)[::-1][0]`. 'all_diag' sets all preconditioners to be diagonal.
 
-`trust_region_scale`: If you have a hunch that your problem is prone to divergence or touchy, or you are 
-training a very large model, you might want to go ahead and reduce this to `1.5`. It changes the direction
-of the update slightly, but can give much more stability for experiments prone to divergence.
-
 `preconditioner_update_probability`: Preconditioner update probability uses a schedule by default 
 that works well for most cases. It anneals from 1 to 0.03 at the beginning of training, so training 
 will be slightly slower at the start but will speed up by around 4k steps. PSGD generally benefits
