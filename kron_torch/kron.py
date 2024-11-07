@@ -1,5 +1,6 @@
-import numpy as np
 import string
+import random
+import numpy as np
 import torch
 
 
@@ -29,12 +30,8 @@ def precond_update_prob_schedule(
     def _schedule(n):
         """Exponential anneal with flat start."""
         n = torch.tensor(n, dtype=torch.float32)
-        prob = torch.minimum(
-            torch.maximum(
-                max_prob * torch.exp(-decay * (n - flat_start)), torch.tensor(min_prob)
-            ),
-            torch.tensor(max_prob),
-        )
+        prob = max_prob * torch.exp(-decay * (n - flat_start))
+        prob.clamp_(min=min_prob, max=max_prob)
         return prob
 
     return _schedule
@@ -78,7 +75,7 @@ class Kron(torch.optim.Optimizer):
         memory_save_mode=None,
         mu_dtype=None,
         precond_dtype=None,
-        trust_region_scale=2.0,
+        trust_region_scale=1.5,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -108,6 +105,7 @@ class Kron(torch.optim.Optimizer):
 
         self._tiny = torch.finfo(torch.bfloat16).tiny
         self._prob_step = 0
+        self.rng = random.Random(5318008)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -125,11 +123,10 @@ class Kron(torch.optim.Optimizer):
         update_prob = self.param_groups[0]["preconditioner_update_probability"]
         if callable(update_prob):
             update_prob = update_prob(self._prob_step)
-        device = self.param_groups[0]["params"][0].device
-        do_update = torch.rand([], device=device) < update_prob
+        do_update = self.rng.random() < update_prob
         self._prob_step += 1
 
-        balance = torch.rand([], device=device) < 0.01 and do_update
+        balance = self.rng.random() < 0.01 and do_update
 
         for group in self.param_groups:
             precond_dtype = group.get("precond_dtype", torch.float32)
@@ -176,8 +173,19 @@ class Kron(torch.optim.Optimizer):
                 state["step"] += 1
 
                 # Update momentum buffer
+                beta = group["b1"]
+                bias_correction = 1 - beta ** state["step"]
                 momentum_buffer = state["momentum_buffer"]
                 momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
+                # Restore momentum dtype
+                if mu_dtype is not None:
+                    momentum_buffer.copy_(
+                        momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
+                    )
+                debiased_momentum = momentum_buffer / bias_correction
+                debiased_momentum = debiased_momentum.to(
+                    dtype=precond_dtype, non_blocking=True
+                )
 
                 # balance preconditioners about every 100 updates
                 if grad.dim() > 1 and balance:
@@ -188,22 +196,22 @@ class Kron(torch.optim.Optimizer):
                     _update_precond(
                         state["Q"],
                         state["exprs"],
-                        torch.randn_like(momentum_buffer, dtype=precond_dtype),
-                        momentum_buffer.to(dtype=precond_dtype, non_blocking=True),
+                        torch.randn_like(debiased_momentum, dtype=precond_dtype),
+                        debiased_momentum,
                         group["precond_lr"],
                         self._tiny,
                     )
 
                 # Precondition gradients
                 pre_grad = _precond_grad(
-                    state["Q"],
-                    state["exprs"],
-                    momentum_buffer.to(dtype=precond_dtype, non_blocking=True),
+                    state["Q"], state["exprs"], debiased_momentum
                 ).to(dtype=p.dtype, non_blocking=True)
 
-                # Apply trust region
+                trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
+                    torch.abs(x) + 1
+                ) + 0.9 * torch.tanh(x)
                 pre_grad = (
-                    torch.tanh(pre_grad / group["trust_region_scale"])
+                    trust_region_fn(pre_grad / group["trust_region_scale"])
                     * group["trust_region_scale"]
                 )
 
@@ -211,10 +219,6 @@ class Kron(torch.optim.Optimizer):
                 if group["weight_decay"] != 0 and p.dim() >= 2:
                     pre_grad.add_(p, alpha=group["weight_decay"])
                 p.add_(pre_grad, alpha=-group["lr"])
-
-                # Restore momentum dtype
-                if mu_dtype is not None:
-                    momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
 
         if total_momentum_size > 0:
             print(
@@ -239,9 +243,9 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
     shape = t.shape
     if len(shape) == 0:  # scalar
         Q = [scale * torch.ones_like(t, dtype=dtype)]
-        exprA = ",->,"
+        exprA = ",->"
         exprGs = [",->"]
-        exprP = ",,->,"
+        exprP = ",,->"
     else:  # tensor
         if len(shape) > 13:
             raise ValueError(
@@ -335,12 +339,13 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True, dynamic=False)
 def _balance_Q(Q_in):
-    norms = torch.stack([torch.max(torch.abs(q)) for q in Q_in])
+    norms = torch.stack([q.norm(float("inf")) for q in Q_in])
     geometric_mean = norms.prod() ** (1 / len(Q_in))
+    norms = geometric_mean / norms
     for i, q in enumerate(Q_in):
-        q.mul_(geometric_mean / norms[i])
+        q.mul_(norms[i])
 
 
 def _lb(A, max_abs):
@@ -362,7 +367,7 @@ def _lb(A, max_abs):
 
 def _norm_lower_bound(A):
     """Cheap lower bound for the spectral norm of A."""
-    max_abs = torch.max(torch.abs(A))
+    max_abs = A.norm(float("inf"))
     return torch.where(max_abs > 0, _lb(A, max_abs), max_abs)
 
 
@@ -408,20 +413,17 @@ def _update_precond(Q, exprs, V, G, step, tiny):
     terms = _q_terms(exprGs, A, conjB)
 
     for q, (term1, term2) in zip(Q, terms):
+        tmp = term1 - term2
+        tmp *= step
         if q.dim() < 2:
-            q.sub_(
-                step
-                / (torch.max(torch.abs(term1 + term2)) + tiny)
-                * (term1 - term2)
-                * q
-            )
+            tmp *= q
+            tmp /= (term1 + term2).norm(float("inf")) + tiny
+            q.sub_(tmp)
         else:
-            q.sub_(
-                step
-                / (_norm_lower_bound(term1 + term2) + tiny)
-                * torch.triu(term1 - term2)
-                @ q
-            )
+            tmp = torch.triu(tmp)
+            tmp /= _norm_lower_bound(term1 + term2) + tiny
+            tmp @= q
+            q.sub_(tmp)
 
 
 @torch.compile(fullgraph=True, dynamic=False)
