@@ -56,11 +56,10 @@ class Kron(torch.optim.Optimizer):
             to set all preconditioners to be triangular, 'one_diag' sets the largest
             or last dim to be diagonal per layer, and 'all_diag' sets all preconditioners
             to be diagonal.
+        momentum_into_precond_update: (bool), whether to send momentum into preconditioner
+            update instead of raw gradients.
         mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator.
         precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
-        trust_region_scale (float): Trust region on preconditioned grads. Normally this
-            doesn't need to be changed but if things seem unstable you can try reducing
-            this to 1.5.
     """
 
     def __init__(
@@ -73,9 +72,9 @@ class Kron(torch.optim.Optimizer):
         max_size_triangular=8192,
         min_ndim_triangular=2,
         memory_save_mode=None,
+        momentum_into_precond_update=True,
         mu_dtype=None,
         precond_dtype=None,
-        trust_region_scale=1.5,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -95,11 +94,11 @@ class Kron(torch.optim.Optimizer):
             max_size_triangular=max_size_triangular,
             min_ndim_triangular=min_ndim_triangular,
             memory_save_mode=memory_save_mode,
+            momentum_into_precond_update=momentum_into_precond_update,
             precond_lr=0.1,  # precond lr hardcoded to 0.1
             precond_init_scale=1.0,  # precond init scale hardcoded to 1.0
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
-            trust_region_scale=trust_region_scale,
         )
         super(Kron, self).__init__(params, defaults)
 
@@ -129,8 +128,11 @@ class Kron(torch.optim.Optimizer):
         balance = self.rng.random() < 0.01 and do_update
 
         for group in self.param_groups:
-            precond_dtype = group.get("precond_dtype", torch.float32)
             mu_dtype = group.get("mu_dtype")
+            precond_dtype = group.get("precond_dtype", torch.float32)
+            momentum_into_precond_update = group.get(
+                "momentum_into_precond_update", True
+            )
 
             for p in group["params"]:
                 if p.grad is None:
@@ -197,7 +199,7 @@ class Kron(torch.optim.Optimizer):
                         state["Q"],
                         state["exprs"],
                         torch.randn_like(debiased_momentum, dtype=precond_dtype),
-                        debiased_momentum,
+                        debiased_momentum if momentum_into_precond_update else grad,
                         group["precond_lr"],
                         self._tiny,
                     )
@@ -210,9 +212,8 @@ class Kron(torch.optim.Optimizer):
                 trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
                     torch.abs(x) + 1
                 ) + 0.9 * torch.tanh(x)
-                pre_grad = (
-                    trust_region_fn(pre_grad / group["trust_region_scale"])
-                    * group["trust_region_scale"]
+                pre_grad = torch.clip(
+                    trust_region_fn(pre_grad / 1.5) * 1.5, min=-2, max=2
                 )
 
                 # Apply weight decay and update parameters
