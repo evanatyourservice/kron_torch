@@ -60,21 +60,24 @@ class Kron(torch.optim.Optimizer):
             update instead of raw gradients.
         mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator.
         precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
+        mean_type (str): Type of mean to use for statistics ('arithmetic', 'geometric', 'harmonic', or 'cesaro').
+        verbose (bool): Whether to print energy after preconditioning.
     """
 
     def __init__(
         self,
         params,
-        lr=0.001,
+        lr=0.01,
         b1=0.9,
         weight_decay=0.0,
         preconditioner_update_probability=None,
         max_size_triangular=8192,
         min_ndim_triangular=2,
         memory_save_mode=None,
-        momentum_into_precond_update=True,
         mu_dtype=None,
         precond_dtype=None,
+        mean_type='geometric',
+        verbose=False,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -94,17 +97,29 @@ class Kron(torch.optim.Optimizer):
             max_size_triangular=max_size_triangular,
             min_ndim_triangular=min_ndim_triangular,
             memory_save_mode=memory_save_mode,
-            momentum_into_precond_update=momentum_into_precond_update,
             precond_lr=0.1,  # precond lr hardcoded to 0.1
             precond_init_scale=1.0,  # precond init scale hardcoded to 1.0
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
+            mean_type=mean_type,
+            verbose=verbose,
         )
         super(Kron, self).__init__(params, defaults)
 
         self._tiny = torch.finfo(torch.bfloat16).tiny
         self._prob_step = 0
         self.rng = random.Random(5318008)
+        self.grad_mean = {}
+        self.grad_var = {}
+        self.grad_log_sum = {}
+        self.grad_sq_log_sum = {}
+        self.grad_reciprocal_sum = {}
+        self.grad_reciprocal_sq_sum = {}
+        self.grad_sum = {}
+        self.grad_sq_sum = {}
+        self.partial_sums = {}
+        self.partial_sq_sums = {}
+        self.grad_count = {}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -130,9 +145,7 @@ class Kron(torch.optim.Optimizer):
         for group in self.param_groups:
             mu_dtype = group.get("mu_dtype")
             precond_dtype = group.get("precond_dtype", torch.float32)
-            momentum_into_precond_update = group.get(
-                "momentum_into_precond_update", True
-            )
+
 
             for p in group["params"]:
                 if p.grad is None:
@@ -172,43 +185,112 @@ class Kron(torch.optim.Optimizer):
                     total_precond_size += precond_size
                     total_precond_mb += precond_mb
 
-                state["step"] += 1
+                    # Initialize statistics for all mean types
+                    self.grad_mean[p] = torch.zeros_like(grad)
+                    self.grad_var[p] = torch.zeros_like(grad)
+                    self.grad_log_sum[p] = torch.zeros_like(grad)
+                    self.grad_sq_log_sum[p] = torch.zeros_like(grad)
+                    self.grad_reciprocal_sum[p] = torch.zeros_like(grad)
+                    self.grad_reciprocal_sq_sum[p] = torch.zeros_like(grad)
+                    self.grad_sum[p] = torch.zeros_like(grad)
+                    self.grad_sq_sum[p] = torch.zeros_like(grad)
+                    self.partial_sums[p] = torch.zeros_like(grad)
+                    self.partial_sq_sums[p] = torch.zeros_like(grad)
+                    self.grad_count[p] = 0
 
-                # Update momentum buffer
-                beta = group["b1"]
-                bias_correction = 1 - beta ** state["step"]
-                momentum_buffer = state["momentum_buffer"]
-                momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
-                # Restore momentum dtype
-                if mu_dtype is not None:
-                    momentum_buffer.copy_(
-                        momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
-                    )
-                debiased_momentum = momentum_buffer / bias_correction
-                debiased_momentum = debiased_momentum.to(
-                    dtype=precond_dtype, non_blocking=True
-                )
+                state["step"] += 1
 
                 # balance preconditioners about every 100 updates
                 if grad.dim() > 1 and balance:
                     _balance_Q(state["Q"])
 
-                # Update preconditioner
-                if do_update:
+                # Update gradient statistics when not updating preconditioner
+                if not do_update:
+                    if group['mean_type'] == 'cesaro':
+                        # Update running sum
+                        self.grad_sum[p] += grad
+                        self.grad_sq_sum[p] += grad * grad
+                        # Update partial sums (Cesàro means)
+                        count = self.grad_count[p] + 1
+                        self.partial_sums[p] = self.grad_sum[p] / count
+                        self.partial_sq_sums[p] = self.grad_sq_sum[p] / count
+                    elif group['mean_type'] == 'geometric':
+                        grad_abs = grad.abs() + self._tiny
+                        self.grad_log_sum[p] += grad_abs.log()
+                        self.grad_sq_log_sum[p] += (grad_abs * grad_abs).log()
+                    elif group['mean_type'] == 'harmonic':
+                        grad_abs = grad.abs() + self._tiny
+                        self.grad_reciprocal_sum[p] += 1.0 / grad_abs
+                        self.grad_reciprocal_sq_sum[p] += 1.0 / (grad_abs * grad_abs)
+                    else:  # arithmetic
+                        count = self.grad_count[p]
+                        new_count = count + 1
+                        delta = grad - self.grad_mean[p]
+                        self.grad_mean[p] += delta / new_count
+                        delta2 = grad - self.grad_mean[p]
+                        self.grad_var[p] += delta * delta2
+                    self.grad_count[p] += 1
+
+                # Update preconditioner using collected statistics
+                if do_update and self.grad_count[p] > 0:
+                    if group['mean_type'] == 'cesaro':
+                        count = self.grad_count[p]
+                        cesaro_mean = self.partial_sums[p]
+                        cesaro_var = self.partial_sq_sums[p] - cesaro_mean * cesaro_mean
+                        cesaro_std = torch.sqrt(torch.clamp(cesaro_var, min=self._tiny))
+                        fake_grad = cesaro_mean + cesaro_std * torch.randn_like(grad, dtype=precond_dtype)
+                        # Reset statistics
+                        self.grad_sum[p].zero_()
+                        self.grad_sq_sum[p].zero_()
+                        self.partial_sums[p].zero_()
+                        self.partial_sq_sums[p].zero_()
+                    elif group['mean_type'] == 'geometric':
+                        count = self.grad_count[p]
+                        geo_mean = (self.grad_log_sum[p] / count).exp() * grad.sign()
+                        geo_std = ((self.grad_sq_log_sum[p] / count).exp()).sqrt()
+                        fake_grad = geo_mean + geo_std * torch.randn_like(grad, dtype=precond_dtype)
+                        # Reset statistics
+                        self.grad_log_sum[p].zero_()
+                        self.grad_sq_log_sum[p].zero_()
+                    elif group['mean_type'] == 'harmonic':
+                        count = self.grad_count[p]
+                        harm_mean = count / self.grad_reciprocal_sum[p] * grad.sign()
+                        harm_std = torch.sqrt(
+                            abs(count / self.grad_reciprocal_sq_sum[p] - 
+                                (count / self.grad_reciprocal_sum[p])**2)
+                        )
+                        fake_grad = harm_mean + harm_std * torch.randn_like(grad, dtype=precond_dtype)
+                        # Reset statistics
+                        self.grad_reciprocal_sum[p].zero_()
+                        self.grad_reciprocal_sq_sum[p].zero_()
+                    else:  # arithmetic
+                        mean = self.grad_mean[p]
+                        std = torch.sqrt(self.grad_var[p] / self.grad_count[p] + self._tiny)
+                        fake_grad = mean + std * torch.randn_like(grad, dtype=precond_dtype)
+                        # Reset statistics
+                        self.grad_mean[p].zero_()
+                        self.grad_var[p].zero_()
+                    
                     _update_precond(
                         state["Q"],
                         state["exprs"],
-                        torch.randn_like(debiased_momentum, dtype=precond_dtype),
-                        debiased_momentum if momentum_into_precond_update else grad,
+                        torch.randn_like(grad, dtype=precond_dtype),
+                        fake_grad,
                         group["precond_lr"],
                         self._tiny,
                     )
+                    self.grad_count[p] = 0
 
-                # Precondition gradients
+                # Apply momentum to raw gradients first
+                momentum_buffer = state["momentum_buffer"]
+                momentum_buffer.mul_(group["b1"]).add_(grad)
+
+                # Then precondition the momentum buffer
                 pre_grad = _precond_grad(
-                    state["Q"], state["exprs"], debiased_momentum
+                    state["Q"], state["exprs"], momentum_buffer
                 ).to(dtype=p.dtype, non_blocking=True)
 
+                # Apply trust region
                 trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
                     torch.abs(x) + 1
                 ) + 0.9 * torch.tanh(x)
@@ -230,6 +312,24 @@ class Kron(torch.optim.Optimizer):
                 f"PSGD Preconditioners size: {total_precond_size} "
                 f"elements, {total_precond_mb:.2f} MB"
             )
+
+        # Calculate mean energy at the end of step if verbose
+        if any(group["verbose"] for group in self.param_groups):
+            all_energies = []
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None and len(self.state[p]) > 0:
+                        pre_grad = _precond_grad(
+                            self.state[p]["Q"], 
+                            self.state[p]["exprs"], 
+                            self.state[p]["momentum_buffer"]
+                        ).to(dtype=p.dtype, non_blocking=True)
+                        energy = torch.sum(pre_grad**2).item()
+                        all_energies.append(energy)
+            
+            if all_energies:
+                mean_energy = sum(all_energies) / len(all_energies)
+                print(f"Mean preconditioned gradient energy: {mean_energy:.6f}")
 
         return loss
 
