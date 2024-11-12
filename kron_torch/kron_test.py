@@ -126,13 +126,14 @@ def main():
 
     optimizer_kron = Kron(
         model_kron.parameters(),
-        lr=0.0001,
-        b1=0,
+        # mean_type="cesaro",
+        lr=0.001,
+        b1=0.9,
         weight_decay=1e-6,
         preconditioner_update_probability=0.1,
         memory_save_mode="one_diag",
         verbose=True,
-        use_grad_stats=False,
+        use_grad_stats=True,
     )
     optimizer_sgd = torch.optim.SGD(
         model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
