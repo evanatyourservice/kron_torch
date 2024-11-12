@@ -4,13 +4,16 @@ import torch
 import random
 
 class AdamStats:
-    def __init__(self, beta=0.5):
+    def __init__(self, beta1=0.5, beta2=0.8, bias_correction=False):
         self.mean = 0
         self.var = 0
         self.count = 0
         self.m1 = 0  # First moment (mean)
         self.m2 = 0  # Second moment
-        self.beta = beta
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.t = 0  # Add timestep counter for bias correction
+        self.bias_correction = bias_correction
 
     def update(self, grad):
         # Update running statistics
@@ -22,24 +25,32 @@ class AdamStats:
         self.var += delta * delta2
         self.count = new_count
 
-        # Update Adam moments
-        self.m1 = self.beta * self.m1 + (1 - self.beta) * grad
-        self.m2 = self.beta * self.m2 + (1 - self.beta) * grad * grad
+        # Update Adam moments with timestep counter
+        self.t += 1
+        self.m1 = self.beta1 * self.m1 + (1 - self.beta1) * grad
+        self.m2 = self.beta2 * self.m2 + (1 - self.beta2) * grad * grad
 
     def get_stats_and_reset(self):
         if self.count == 0:
             return None, None, None, None
         std = torch.sqrt(self.var / self.count)
         mean = self.mean
-        m1, m2 = self.m1, self.m2
+        
+        # Apply bias corrections only if enabled
+        if self.bias_correction:
+            m1_corrected = self.m1 / (1 - self.beta1**self.t)
+            m2_corrected = self.m2 / (1 - self.beta2**self.t)
+        else:
+            m1_corrected = self.m1
+            m2_corrected = self.m2
         
         # Reset statistics
         self.mean = 0
         self.var = 0
         self.count = 0
-        # Note: we don't reset m1 and m2 as they are running estimates
+        # Note: we don't reset t as it needs to continue for proper bias correction
         
-        return mean, std, m1, m2
+        return mean, std, m1_corrected, m2_corrected
 
 def update_precond_newton_math_(Q, v, h, step, tiny):
     """Update the preconditioner P = Q'*Q with (v, h), adjusted for EMA gradients."""
@@ -49,49 +60,73 @@ def update_precond_newton_math_(Q, v, h, step, tiny):
     mu = step / (torch.sum(a**2 + b**2) + tiny)
     Q.sub_(mu * grad @ Q)
 
+def run_experiment(beta1, beta2=0.9, num_iterations=10000):
+    Q = torch.eye(N)
+    stats = AdamStats(beta1=beta1, beta2=beta2,bias_correction=False)
+    avg_energies = []
 
-N = 100
-num_iterations = 100000
-precond_update_prob = 0.1
-
-A = torch.triu(torch.rand(N, N))
-b = torch.randn(N, 1)
-C = A @ A.T + b @ b.T  # the true covariance matrix of gradient
-beta = 0.9
-Q = torch.eye(N)
-stats = AdamStats(beta=beta)
-avg_energies = []
-
-for i in range(num_iterations):
-    g = A @ torch.randn(N, 1) + b  # gradient
-    
-    # Update statistics when not updating preconditioner
-    if random.random() >= precond_update_prob:
+    for i in range(num_iterations):
+        # Use Cauchy distribution like in second example
+        g = A @ torch.distributions.Cauchy(0, 1).sample((N, 1)) + b
+        g = g / torch.linalg.norm(g)  # normalize gradient
+        
         stats.update(g)
+        mean, std, m1, m2 = stats.get_stats_and_reset()
+        
+        if mean is not None:
+            update_precond_newton_math_(
+                Q,
+                torch.randn_like(m1),
+                m1 + alpha * torch.sqrt(torch.clamp(m2 - m1 * m1, 0)) * torch.randn_like(m1),
+                0.1 * (1 - i / num_iterations),
+                0.0,
+            )
+
+        avg_energy = torch.mean((Q.T @ Q @ g) ** 2)
+        avg_energies.append(avg_energy.item())
     
-    if random.random() < precond_update_prob:
-        mean, std, m1, m2 = stats.get_stats_and_reset() if stats.count > 0 else (g, torch.zeros_like(g), g, g*g)
-        
-        # Use Adam-style update with sqrt clamp like in kron_adam_
-        h = m1 + torch.sqrt(torch.clamp(m2 - m1 * m1, 0)) * torch.randn_like(g)
-        
-        update_precond_newton_math_(
-            Q,
-            torch.randn_like(h),
-            h,
-            0.1 * (1 - i / num_iterations),
-            0.0,
-        )
+    return Q, avg_energies
 
-    to_precondition = g  # or could use m1 if you want to precondition the Adam estimate
-    avg_energy = torch.mean((Q.T @ Q @ to_precondition) ** 2)
-    avg_energies.append(avg_energy.item())
+# Setup experiment
+N = 100
+# Define matrices A, b, and C
+A = torch.randn(N, N)  # Random matrix for demonstration
+A = A @ A.T  # Make it symmetric positive definite
+b = torch.randn(N, 1)  # Random vector
+C = torch.eye(N)  # Identity matrix for covariance
 
-print(torch.linalg.cond(Q))
-#%%
-plt.semilogy(avg_energies)
+num_iterations = 10000
+betas = [0.0, 0.5, 0.9, 0.95]
+alpha = 1
+
+# Setup plotting
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+axes = axes.flatten()
+
+# Run experiments for different betas
+for idx, beta in enumerate(betas):
+    Q, avg_energies = run_experiment(beta)
+    
+    # Plot energy
+    axes[idx].semilogy(avg_energies)
+    axes[idx].set_title(f"β = {beta}")
+    axes[idx].set_xlabel("Iterations")
+    axes[idx].set_ylabel("Energy")
+    
+    print(f"Condition number for β={beta}: {torch.linalg.cond(Q)}")
+    print(f"Trace of Q: {torch.trace(Q)}")
+
+plt.tight_layout()
 plt.show()
 
-plt.imshow(Q.T @ Q @ C @ Q.T @ Q)
+# Plot covariance matrices
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+axes = axes.flatten()
+
+for idx, beta in enumerate(betas):
+    axes[idx].imshow(Q.T @ Q @ C @ Q.T @ Q)
+    axes[idx].set_title(f"Covariance Matrix (β = {beta})")
+
+plt.tight_layout()
 plt.show()
 # %%
