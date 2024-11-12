@@ -131,6 +131,9 @@ class Kron(torch.optim.Optimizer):
 
         balance = self.rng.random() < 0.01 and do_update
 
+        if any(group["verbose"] for group in self.param_groups):
+            all_energies = []
+
         for group in self.param_groups:
             mu_dtype = group.get("mu_dtype")
             precond_dtype = group.get("precond_dtype", torch.float32)
@@ -223,6 +226,11 @@ class Kron(torch.optim.Optimizer):
                     state["Q"], state["exprs"], momentum_buffer
                 ).to(dtype=p.dtype, non_blocking=True)
 
+                # Calculate energy here if verbose
+                if group["verbose"]:
+                    energy = torch.sum(pre_grad**2).item()
+                    all_energies.append(energy)
+
                 # Apply trust region
                 trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
                     torch.abs(x) + 1
@@ -246,23 +254,10 @@ class Kron(torch.optim.Optimizer):
                 f"elements, {total_precond_mb:.2f} MB"
             )
 
-        # Calculate mean energy at the end of step if verbose
-        if any(group["verbose"] for group in self.param_groups):
-            all_energies = []
-            for group in self.param_groups:
-                for p in group["params"]:
-                    if p.grad is not None and len(self.state[p]) > 0:
-                        pre_grad = _precond_grad(
-                            self.state[p]["Q"], 
-                            self.state[p]["exprs"], 
-                            self.state[p]["momentum_buffer"]
-                        ).to(dtype=p.dtype, non_blocking=True)
-                        energy = torch.sum(pre_grad**2).item()
-                        all_energies.append(energy)
-            
-            if all_energies:
-                mean_energy = sum(all_energies) / len(all_energies)
-                print(f"Mean preconditioned gradient energy: {mean_energy:.6f}")
+        # Print mean energy at the end if we collected any
+        if any(group["verbose"] for group in self.param_groups) and all_energies:
+            mean_energy = sum(all_energies) / len(all_energies)
+            print(f"Mean preconditioned gradient energy: {mean_energy:.6f}")
 
         return loss
 

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 import time
 
-from kron import Kron
+from kron_simple import Kron
 
 
 class ConvNet(nn.Module):
@@ -129,9 +129,8 @@ def main():
         lr=0.0001,
         b1=0,
         weight_decay=1e-6,
-        preconditioner_update_probability=0.1,
+        preconditioner_update_probability=0.95,
         memory_save_mode="one_diag",
-        mean_type="arithmetic",
         verbose=True
     )
     optimizer_sgd = torch.optim.SGD(
