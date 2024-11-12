@@ -120,7 +120,9 @@ class Kron(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        all_energies = []
+        grad_energies = []
+        fake_grad_energies = []
+        pre_grad_energies = []
 
         total_momentum_size = 0
         total_momentum_mb = 0
@@ -207,6 +209,11 @@ class Kron(torch.optim.Optimizer):
                         std = torch.sqrt(self.grad_var[p] / self.grad_count[p] + self._tiny)
                         fake_grad = mean + std * torch.randn_like(grad, dtype=precond_dtype)
                         
+                        # Calculate fake_grad energy right after creating it
+                        if group["verbose"]:
+                            fake_grad_energy = torch.mean(fake_grad**2).item()
+                            fake_grad_energies.append(fake_grad_energy)
+                        
                         # Reset statistics
                         self.grad_mean[p].zero_()
                         self.grad_var[p].zero_()
@@ -214,6 +221,10 @@ class Kron(torch.optim.Optimizer):
                     else:
                         # Use raw gradients if stats disabled or no stats accumulated
                         fake_grad = grad.to(dtype=precond_dtype)
+                        # Calculate energy for this case too
+                        if group["verbose"]:
+                            fake_grad_energy = torch.mean(fake_grad**2).item()
+                            fake_grad_energies.append(fake_grad_energy)
 
                     _update_precond(
                         state["Q"],
@@ -235,8 +246,15 @@ class Kron(torch.optim.Optimizer):
 
                 # Calculate energy here if verbose
                 if group["verbose"]:
-                    energy = torch.sum(pre_grad**2).item()
-                    all_energies.append(energy)
+                    grad_energy = torch.mean(grad**2).item()
+                    pre_grad_energy = torch.mean(pre_grad**2).item()
+                    grad_energies.append(grad_energy)
+                    pre_grad_energies.append(pre_grad_energy)
+                    
+                    # Only calculate fake_grad energy during preconditioner updates
+                    if do_update and group["use_grad_stats"] and self.grad_count[p] > 0:
+                        fake_grad_energy = torch.mean(fake_grad**2).item()
+                        fake_grad_energies.append(fake_grad_energy)
 
                 # Apply trust region
                 trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
@@ -261,10 +279,19 @@ class Kron(torch.optim.Optimizer):
                 f"elements, {total_precond_mb:.2f} MB"
             )
 
-        # Print mean energy at the end if we collected any
-        if any(group["verbose"] for group in self.param_groups) and all_energies:
-            mean_energy = sum(all_energies) / len(all_energies)
-            print(f"Mean preconditioned gradient energy: {mean_energy:.6f}")
+        # Print mean energies at the end if we collected any
+        if any(group["verbose"] for group in self.param_groups):
+            if grad_energies:
+                mean_grad_energy = sum(grad_energies) / len(grad_energies)
+                print(f"Mean raw gradient energy: {mean_grad_energy:.6f}")
+            
+            if pre_grad_energies:
+                mean_pre_grad_energy = sum(pre_grad_energies) / len(pre_grad_energies)
+                print(f"Mean preconditioned gradient energy: {mean_pre_grad_energy:.6f}")
+            
+            if fake_grad_energies:
+                mean_fake_grad_energy = sum(fake_grad_energies) / len(fake_grad_energies)
+                print(f"Mean fake gradient energy: {mean_fake_grad_energy:.6f}")
 
         return loss
 
