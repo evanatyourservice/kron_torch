@@ -61,6 +61,7 @@ class Kron(torch.optim.Optimizer):
         mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator.
         precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
         verbose (bool): Whether to print energy after preconditioning.
+        use_grad_stats (bool): Whether to use gradient statistics for preconditioner updates.
     """
 
     def __init__(
@@ -76,6 +77,7 @@ class Kron(torch.optim.Optimizer):
         mu_dtype=None,
         precond_dtype=None,
         verbose=False,
+        use_grad_stats=True,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -100,6 +102,7 @@ class Kron(torch.optim.Optimizer):
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
             verbose=verbose,
+            use_grad_stats=use_grad_stats,
         )
         super(Kron, self).__init__(params, defaults)
 
@@ -117,6 +120,8 @@ class Kron(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        all_energies = []
+
         total_momentum_size = 0
         total_momentum_mb = 0
         total_precond_size = 0
@@ -130,9 +135,6 @@ class Kron(torch.optim.Optimizer):
         self._prob_step += 1
 
         balance = self.rng.random() < 0.01 and do_update
-
-        if any(group["verbose"] for group in self.param_groups):
-            all_energies = []
 
         for group in self.param_groups:
             mu_dtype = group.get("mu_dtype")
@@ -189,7 +191,7 @@ class Kron(torch.optim.Optimizer):
                     _balance_Q(state["Q"])
 
                 # Update gradient statistics when not updating preconditioner
-                if not do_update:
+                if not do_update and group["use_grad_stats"]:
                     count = self.grad_count[p]
                     new_count = count + 1
                     delta = grad - self.grad_mean[p]
@@ -198,15 +200,20 @@ class Kron(torch.optim.Optimizer):
                     self.grad_var[p] += delta * delta2
                     self.grad_count[p] += 1
 
-                # Update preconditioner using collected statistics
-                if do_update and self.grad_count[p] > 0:
-                    mean = self.grad_mean[p]
-                    std = torch.sqrt(self.grad_var[p] / self.grad_count[p] + self._tiny)
-                    fake_grad = mean + std * torch.randn_like(grad, dtype=precond_dtype)
-                    # Reset statistics
-                    self.grad_mean[p].zero_()
-                    self.grad_var[p].zero_()
-                    self.grad_count[p] = 0
+                # Update preconditioner using collected statistics or raw gradients
+                if do_update:
+                    if group["use_grad_stats"] and self.grad_count[p] > 0:
+                        mean = self.grad_mean[p]
+                        std = torch.sqrt(self.grad_var[p] / self.grad_count[p] + self._tiny)
+                        fake_grad = mean + std * torch.randn_like(grad, dtype=precond_dtype)
+                        
+                        # Reset statistics
+                        self.grad_mean[p].zero_()
+                        self.grad_var[p].zero_()
+                        self.grad_count[p] = 0
+                    else:
+                        # Use raw gradients if stats disabled or no stats accumulated
+                        fake_grad = grad.to(dtype=precond_dtype)
 
                     _update_precond(
                         state["Q"],
