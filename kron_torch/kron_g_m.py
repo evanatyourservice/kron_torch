@@ -232,18 +232,20 @@ class Kron(torch.optim.Optimizer):
                         state["Q"],
                         state["exprs"],
                         torch.randn_like(grad, dtype=precond_dtype),
-                        fake_grad,
-                        group["precond_lr"],
-                        self._tiny,
-                    )
-                    _update_precond(
-                        state["Q"],
-                        state["exprs"],
-                        torch.randn_like(grad, dtype=precond_dtype),
                         momentum_buffer,
                         group["precond_lr"],
                         self._tiny,
                     )
+
+                    _update_precond(
+                        state["Q"],
+                        state["exprs"],
+                        torch.randn_like(grad, dtype=precond_dtype),
+                        fake_grad,
+                        group["precond_lr"],
+                        self._tiny,
+                    )
+
 
 
                 # Then precondition the momentum buffer
