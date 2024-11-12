@@ -129,9 +129,10 @@ def main():
         lr=0.0001,
         b1=0,
         weight_decay=1e-6,
-        preconditioner_update_probability=0.95,
+        preconditioner_update_probability=0.1,
         memory_save_mode="one_diag",
-        verbose=True
+        verbose=True,
+        use_grad_stats=False,
     )
     optimizer_sgd = torch.optim.SGD(
         model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
