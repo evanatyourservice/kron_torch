@@ -155,23 +155,6 @@ class Kron(torch.optim.Optimizer):
                         dtype=precond_dtype,
                     )
 
-                    # Print sizes
-                    momentum_size = state["momentum_buffer"].numel()
-                    momentum_mb = (
-                        momentum_size
-                        * state["momentum_buffer"].element_size()
-                        / (2**20)
-                    )
-                    total_momentum_size += momentum_size
-                    total_momentum_mb += momentum_mb
-
-                    precond_size = sum(q.numel() for q in state["Q"])
-                    precond_mb = sum(
-                        q.numel() * q.element_size() for q in state["Q"]
-                    ) / (2**20)
-                    total_precond_size += precond_size
-                    total_precond_mb += precond_mb
-
                 state["step"] += 1
 
                 # Update momentum buffer
@@ -179,19 +162,6 @@ class Kron(torch.optim.Optimizer):
                 bias_correction = 1 - beta ** state["step"]
                 momentum_buffer = state["momentum_buffer"]
                 momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
-                # Restore momentum dtype
-                if mu_dtype is not None:
-                    momentum_buffer.copy_(
-                        momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
-                    )
-                debiased_momentum = momentum_buffer / bias_correction
-                debiased_momentum = debiased_momentum.to(
-                    dtype=precond_dtype, non_blocking=True
-                )
-
-                # balance preconditioners about every 100 updates
-                if grad.dim() > 1 and balance:
-                    _balance_Q(state["Q"])
 
                 # Update preconditioner
                 if do_update:
@@ -209,27 +179,11 @@ class Kron(torch.optim.Optimizer):
                     state["Q"], state["exprs"], debiased_momentum
                 ).to(dtype=p.dtype, non_blocking=True)
 
-                trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
-                    torch.abs(x) + 1
-                ) + 0.9 * torch.tanh(x)
-                pre_grad = torch.clip(
-                    trust_region_fn(pre_grad / 1.5) * 1.5, min=-2, max=2
-                )
 
                 # Apply weight decay and update parameters
                 if group["weight_decay"] != 0 and p.dim() >= 2:
                     pre_grad.add_(p, alpha=group["weight_decay"])
                 p.add_(pre_grad, alpha=-group["lr"])
-
-        if total_momentum_size > 0:
-            print(
-                f"PSGD Momentum buffer size: {total_momentum_size} "
-                f"elements, {total_momentum_mb:.2f} MB"
-            )
-            print(
-                f"PSGD Preconditioners size: {total_precond_size} "
-                f"elements, {total_precond_mb:.2f} MB"
-            )
 
         return loss
 
