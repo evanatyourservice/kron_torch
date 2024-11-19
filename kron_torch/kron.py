@@ -172,7 +172,7 @@ class Kron(torch.optim.Optimizer):
 
                 # Precondition gradients
                 pre_grad = _precond_grad(
-                    state["Q"], state["exprs"], debiased_momentum
+                    state["Q"], state["exprs"], momentum_buffer
                 ).to(dtype=p.dtype, non_blocking=True)
 
 
