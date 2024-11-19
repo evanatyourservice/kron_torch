@@ -113,10 +113,6 @@ class Kron(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        total_momentum_size = 0
-        total_momentum_mb = 0
-        total_precond_size = 0
-        total_precond_mb = 0
 
         # update preconditioners all together
         update_prob = self.param_groups[0]["preconditioner_update_probability"]
