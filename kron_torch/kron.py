@@ -165,7 +165,7 @@ class Kron(torch.optim.Optimizer):
                         state["Q"],
                         state["exprs"],
                         torch.randn_like(debiased_momentum, dtype=precond_dtype),
-                        debiased_momentum if momentum_into_precond_update else grad,
+                        momentum_buffer if momentum_into_precond_update else grad,
                         group["precond_lr"],
                         self._tiny,
                     )
