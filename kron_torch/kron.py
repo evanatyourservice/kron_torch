@@ -2,6 +2,7 @@ import string
 import random
 import numpy as np
 import torch
+import math
 
 
 torch._dynamo.config.cache_size_limit = 1_000_000
@@ -37,14 +38,15 @@ def precond_update_prob_schedule(
     return _schedule
 
 
-class Kron(torch.optim.Optimizer):
+class KronMars(torch.optim.Optimizer):
     """Implements PSGD Kron from https://github.com/lixilinx/psgd_torch.
 
     Args:
         params (iterable): Iterable of parameters to optimize or dicts defining
             parameter groups.
         lr (float): Learning rate.
-        b1 (float): Momentum parameter.
+        momentum (float): Momentum parameter.
+        mars_beta (float): MARS beta parameter.
         weight_decay (float): Weight decay (L2 penalty).
         preconditioner_update_probability (callable or float, optional): Probability of
             updating the preconditioner. If None, defaults to a schedule that anneals
@@ -60,13 +62,20 @@ class Kron(torch.optim.Optimizer):
             update instead of raw gradients.
         mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator.
         precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
+        verbose (bool): Whether to print energy statistics.
+        use_grad_stats (bool): Whether to use gradient statistics for preconditioner update.
+        std_scale (float): Scale factor for the standard deviation in the fake momentum calculation.
+        precond_lr (float): Learning rate for preconditioner update.
+        precond_lr_schedule (callable or None): Schedule for preconditioner learning rate.
+        gamma (float): MARS gamma parameter.
     """
 
     def __init__(
         self,
         params,
         lr=0.001,
-        b1=0.9,
+        momentum=0.9,
+        mars_beta=0.9,
         weight_decay=0.0,
         preconditioner_update_probability=None,
         max_size_triangular=8192,
@@ -75,11 +84,19 @@ class Kron(torch.optim.Optimizer):
         momentum_into_precond_update=True,
         mu_dtype=None,
         precond_dtype=None,
+        verbose=False,
+        use_grad_stats=True,
+        std_scale=1.0,
+        precond_lr=0.1,
+        precond_lr_schedule=None,
+        gamma=0.05,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= b1 < 1.0:
-            raise ValueError(f"Invalid beta parameter: {b1}")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"Invalid momentum parameter: {momentum}")
+        if not 0.0 <= mars_beta < 1.0:
+            raise ValueError(f"Invalid MARS beta parameter: {mars_beta}")
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
@@ -88,23 +105,36 @@ class Kron(torch.optim.Optimizer):
 
         defaults = dict(
             lr=lr,
-            b1=b1,
+            momentum=momentum,
+            mars_beta=mars_beta,
             weight_decay=weight_decay,
             preconditioner_update_probability=preconditioner_update_probability,
             max_size_triangular=max_size_triangular,
             min_ndim_triangular=min_ndim_triangular,
             memory_save_mode=memory_save_mode,
             momentum_into_precond_update=momentum_into_precond_update,
-            precond_lr=0.1,  # precond lr hardcoded to 0.1
-            precond_init_scale=1.0,  # precond init scale hardcoded to 1.0
+            precond_lr=precond_lr,
+            precond_lr_schedule=precond_lr_schedule,
+            precond_init_scale=2.0,
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
+            verbose=verbose,
+            use_grad_stats=use_grad_stats,
+            std_scale=std_scale,
+            gamma=gamma,
         )
-        super(Kron, self).__init__(params, defaults)
+        super(KronMars, self).__init__(params, defaults)
 
         self._tiny = torch.finfo(torch.bfloat16).tiny
+        self._eps = torch.finfo(torch.bfloat16).eps
         self._prob_step = 0
         self.rng = random.Random(5318008)
+        self.momentum_mean = {}
+        self.momentum_var = {}
+        self.momentum_count = {}
+        self.momentum_energies = []
+        self.pre_grad_energies = []
+        self.fake_momentum_energies = []
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -112,6 +142,10 @@ class Kron(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        momentum_energies = []
+        fake_momentum_energies = []
+        pre_grad_energies = []
 
         total_momentum_size = 0
         total_momentum_mb = 0
@@ -134,18 +168,27 @@ class Kron(torch.optim.Optimizer):
                 "momentum_into_precond_update", True
             )
 
+            # Get current precond_lr based on schedule
+            precond_lr = group['precond_lr']
+            if group['precond_lr_schedule'] is not None:
+                precond_lr = group['precond_lr_schedule'](self._prob_step)
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
 
                 grad = p.grad
+                grad_norm = (1e-30 + grad.square().mean().sqrt())
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"Warning: grad_norm is {grad_norm}, skipping update")
+                    continue
+                grad = grad / grad_norm
                 state = self.state[p]
 
                 if len(state) == 0:
                     state["step"] = 0
-                    state["momentum_buffer"] = torch.zeros_like(
-                        p, dtype=mu_dtype or p.dtype
-                    )
+                    state["momentum_buffer"] = torch.zeros_like(p, dtype=mu_dtype or p.dtype)
+                    state["prev_grad"] = torch.zeros_like(p)
                     state["Q"], state["exprs"] = init_Q_exprs(
                         p,
                         group["precond_init_scale"],
@@ -154,6 +197,7 @@ class Kron(torch.optim.Optimizer):
                         group["memory_save_mode"],
                         dtype=precond_dtype,
                     )
+                    state["pre_grad_energy"] = 0.0
 
                     # Print sizes
                     momentum_size = state["momentum_buffer"].numel()
@@ -172,20 +216,33 @@ class Kron(torch.optim.Optimizer):
                     total_precond_size += precond_size
                     total_precond_mb += precond_mb
 
+                    # Initialize statistics
+                    self.momentum_mean[p] = torch.zeros_like(grad)
+                    self.momentum_var[p] = torch.zeros_like(grad)
+                    self.momentum_count[p] = 0
+
                 state["step"] += 1
 
-                # Update momentum buffer
-                beta = group["b1"]
-                bias_correction = 1 - beta ** state["step"]
+                # Calculate MARS correction term (without clipping)
+                prev_grad = state["prev_grad"]
+                correction = group["gamma"] * group["mars_beta"] / (1 - group["mars_beta"]) * (grad - prev_grad)
+                c_t = grad + correction
+
+                # Store current gradient for next iteration
+                state["prev_grad"].copy_(grad)
+
+                # Update momentum buffer with corrected gradient
                 momentum_buffer = state["momentum_buffer"]
-                momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
+                momentum_buffer.mul_(group["momentum"]).add_(c_t, alpha=1 - group["momentum"])
+                
+                # Apply Nesterov update with corrected gradient
+                nesterov_momentum = momentum_buffer.mul(group["momentum"]).add_(c_t, alpha=1 - group["momentum"])
                 # Restore momentum dtype
                 if mu_dtype is not None:
-                    momentum_buffer.copy_(
-                        momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
+                    nesterov_momentum.copy_(
+                        nesterov_momentum.to(dtype=mu_dtype, non_blocking=True)
                     )
-                debiased_momentum = momentum_buffer / bias_correction
-                debiased_momentum = debiased_momentum.to(
+                nesterov_momentum = nesterov_momentum.to(
                     dtype=precond_dtype, non_blocking=True
                 )
 
@@ -195,31 +252,93 @@ class Kron(torch.optim.Optimizer):
 
                 # Update preconditioner
                 if do_update:
+                    if group["use_grad_stats"] and self.momentum_count[p] > 0:
+                        mean = self.momentum_mean[p]
+                        # Add clipping to prevent extreme values
+                        var = torch.clamp(self.momentum_var[p], min=0, max=1e6)
+                        std = torch.sqrt(var / self.momentum_count[p] + self._eps)
+                        
+                        # Check for nan/inf before creating fake momentum
+                        if torch.isnan(std).any() or torch.isinf(std).any():
+                            print("Warning: std contains nan/inf, using momentum buffer instead")
+                            update_grad = nesterov_momentum if group["momentum_into_precond_update"] else grad
+                        else:
+                            noise = torch.randn_like(momentum_buffer, dtype=precond_dtype)
+                            # Clip the noise to prevent extreme values
+                            noise = torch.clamp(noise, min=-3, max=3)
+                            fake_momentum = mean + group["std_scale"] * std * noise
+                            
+                            if group["verbose"]:
+                                fake_momentum_energy = torch.mean(fake_momentum**2).item()
+                                if not (math.isnan(fake_momentum_energy) or math.isinf(fake_momentum_energy)):
+                                    fake_momentum_energies.append(fake_momentum_energy)
+                            
+                            update_grad = fake_momentum if group["momentum_into_precond_update"] else grad
+                        
+                        # Reset statistics
+                        self.momentum_mean[p].zero_()
+                        self.momentum_var[p].zero_()
+                        self.momentum_count[p] = 0
+                    else:
+                        update_grad = nesterov_momentum if group["momentum_into_precond_update"] else grad
+
+                    if group["verbose"]:
+                        momentum_energy = torch.mean(momentum_buffer**2).item()
+                        if not (math.isnan(momentum_energy) or math.isinf(momentum_energy)):
+                            momentum_energies.append(momentum_energy)
+
+                    # Check update_grad for nan/inf before updating preconditioner
+                    if torch.isnan(update_grad).any() or torch.isinf(update_grad).any():
+                        print("Warning: update_grad contains nan/inf, skipping preconditioner update")
+                        continue
+                    
                     _update_precond(
                         state["Q"],
                         state["exprs"],
-                        torch.randn_like(debiased_momentum, dtype=precond_dtype),
-                        debiased_momentum if momentum_into_precond_update else grad,
-                        group["precond_lr"],
+                        torch.randn_like(momentum_buffer, dtype=precond_dtype),
+                        update_grad,
+                        precond_lr,
                         self._tiny,
                     )
 
                 # Precondition gradients
                 pre_grad = _precond_grad(
-                    state["Q"], state["exprs"], debiased_momentum
+                    state["Q"], state["exprs"], update_grad
                 ).to(dtype=p.dtype, non_blocking=True)
 
-                trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
-                    torch.abs(x) + 1
-                ) + 0.9 * torch.tanh(x)
-                pre_grad = torch.clip(
-                    trust_region_fn(pre_grad / 1.5) * 1.5, min=-2, max=2
-                )
+                # Store pre_grad_energy in state
+                state["pre_grad_energy"] = torch.mean(pre_grad**2).item()
 
+                if group["verbose"]:
+                    pre_grad_energy = state["pre_grad_energy"]
+                    if not (math.isnan(pre_grad_energy) or math.isinf(pre_grad_energy)):
+                        pre_grad_energies.append(pre_grad_energy)
+
+                # trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
+                #     torch.abs(x) + 1
+                # ) + 0.9 * torch.tanh(x)
+                # pre_grad = torch.clip(
+                #     trust_region_fn(pre_grad / 1.5) * 1.5, min=-2, max=2
+                # )
+                # pre_grad_norm = (1e-30+pre_grad.square().mean().sqrt())
+                # if torch.isnan(pre_grad_norm) or torch.isinf(pre_grad_norm):
+                #     print(f"Warning: pre_grad_norm is {pre_grad_norm}, skipping update")
+                #     continue
+                # pre_grad = pre_grad / pre_grad_norm
                 # Apply weight decay and update parameters
                 if group["weight_decay"] != 0 and p.dim() >= 2:
                     pre_grad.add_(p, alpha=group["weight_decay"])
                 p.add_(pre_grad, alpha=-group["lr"])
+
+                # Update momentum statistics when not updating preconditioner
+                if not do_update and group["use_grad_stats"]:
+                    count = self.momentum_count[p]
+                    new_count = count + 1
+                    delta = momentum_buffer - self.momentum_mean[p]
+                    self.momentum_mean[p] += delta / new_count
+                    delta2 = momentum_buffer - self.momentum_mean[p]
+                    self.momentum_var[p] += delta * delta2
+                    self.momentum_count[p] += 1
 
         if total_momentum_size > 0:
             print(
@@ -230,6 +349,34 @@ class Kron(torch.optim.Optimizer):
                 f"PSGD Preconditioners size: {total_precond_size} "
                 f"elements, {total_precond_mb:.2f} MB"
             )
+
+        # Print energies if verbose
+        if any(group["verbose"] for group in self.param_groups):
+            if momentum_energies:
+                mean_momentum_energy = sum(momentum_energies) / len(momentum_energies)
+                print(f"Mean momentum buffer energy: {mean_momentum_energy:.6f}")
+            
+            if pre_grad_energies:
+                mean_pre_grad_energy = sum(pre_grad_energies) / len(pre_grad_energies)
+                print(f"Mean preconditioned gradient energy: {mean_pre_grad_energy:.6f}")
+            
+            if fake_momentum_energies:
+                mean_fake_momentum_energy = sum(fake_momentum_energies) / len(fake_momentum_energies)
+                print(f"Mean fake momentum energy: {mean_fake_momentum_energy:.6f}")
+
+        # Clear energy lists at the start of each step
+        self.momentum_energies.clear()
+        self.pre_grad_energies.clear()
+        self.fake_momentum_energies.clear()
+
+        # Print energies if verbose
+        if any(group["verbose"] for group in self.param_groups):
+            if momentum_energies:
+                self.momentum_energies.extend(momentum_energies)
+            if pre_grad_energies:
+                self.pre_grad_energies.extend(pre_grad_energies)
+            if fake_momentum_energies:
+                self.fake_momentum_energies.extend(fake_momentum_energies)
 
         return loss
 
