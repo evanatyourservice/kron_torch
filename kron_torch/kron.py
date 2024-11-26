@@ -303,7 +303,7 @@ class KronMars(torch.optim.Optimizer):
 
                 # Precondition gradients
                 pre_grad = _precond_grad(
-                    state["Q"], state["exprs"], update_grad
+                    state["Q"], state["exprs"], momentum_buffer
                 ).to(dtype=p.dtype, non_blocking=True)
 
                 # Store pre_grad_energy in state
