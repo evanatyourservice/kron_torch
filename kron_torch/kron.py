@@ -14,7 +14,7 @@ except AttributeError:
 
 
 def precond_update_prob_schedule(
-    max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=250
+    max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=500
 ):
     """Anneal preconditioner update probability during beginning of training.
 
@@ -45,6 +45,7 @@ class Kron(torch.optim.Optimizer):
             parameter groups.
         lr (float): Learning rate.
         b1 (float): Momentum parameter.
+        normalize_grads (bool): Whether to normalize incoming gradients layer-wise.
         weight_decay (float): Weight decay (L2 penalty).
         preconditioner_update_probability (callable or float, optional): Probability of
             updating the preconditioner. If None, defaults to a schedule that anneals
@@ -67,6 +68,7 @@ class Kron(torch.optim.Optimizer):
         params,
         lr=0.001,
         b1=0.9,
+        normalize_grads=False,
         weight_decay=0.0,
         preconditioner_update_probability=None,
         max_size_triangular=8192,
@@ -89,6 +91,7 @@ class Kron(torch.optim.Optimizer):
         defaults = dict(
             lr=lr,
             b1=b1,
+            normalize_grads=normalize_grads,
             weight_decay=weight_decay,
             preconditioner_update_probability=preconditioner_update_probability,
             max_size_triangular=max_size_triangular,
@@ -104,6 +107,7 @@ class Kron(torch.optim.Optimizer):
 
         self._tiny = torch.finfo(torch.bfloat16).tiny
         self._prob_step = 0
+        self._update_counter = 0
         self.rng = random.Random(5318008)
 
     @torch.no_grad()
@@ -118,13 +122,17 @@ class Kron(torch.optim.Optimizer):
         total_precond_size = 0
         total_precond_mb = 0
 
-        # update preconditioners all together
+        # update preconditioners all together deterministically
         update_prob = self.param_groups[0]["preconditioner_update_probability"]
         if callable(update_prob):
             update_prob = update_prob(self._prob_step)
-        do_update = self.rng.random() < update_prob
+        self._update_counter += 1
+        do_update = self._update_counter >= 1 / update_prob
+        if do_update:
+            self._update_counter = 0
         self._prob_step += 1
 
+        # balance preconditioners roughly every 100 updates
         balance = self.rng.random() < 0.01 and do_update
 
         for group in self.param_groups:
@@ -174,6 +182,9 @@ class Kron(torch.optim.Optimizer):
 
                 state["step"] += 1
 
+                if group["normalize_grads"]:
+                    grad /= torch.norm(grad) + 1e-12
+
                 # Update momentum buffer
                 beta = group["b1"]
                 bias_correction = 1 - beta ** state["step"]
@@ -208,13 +219,6 @@ class Kron(torch.optim.Optimizer):
                 pre_grad = _precond_grad(
                     state["Q"], state["exprs"], debiased_momentum
                 ).to(dtype=p.dtype, non_blocking=True)
-
-                trust_region_fn = lambda x: 0.1 * torch.sign(x) * torch.log(
-                    torch.abs(x) + 1
-                ) + 0.9 * torch.tanh(x)
-                pre_grad = torch.clip(
-                    trust_region_fn(pre_grad / 1.5) * 1.5, min=-2, max=2
-                )
 
                 # Apply weight decay and update parameters
                 if group["weight_decay"] != 0 and p.dim() >= 2:
