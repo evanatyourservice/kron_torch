@@ -62,6 +62,7 @@ class Kron(torch.optim.Optimizer):
             update instead of raw gradients.
         mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator.
         precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
+        exact_hessian_vector_product (bool): Whether to use exact Hessian-vector products.
     """
 
     def __init__(
@@ -78,6 +79,7 @@ class Kron(torch.optim.Optimizer):
         momentum_into_precond_update=True,
         mu_dtype=None,
         precond_dtype=None,
+        exact_hessian_vector_product=True,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -110,47 +112,76 @@ class Kron(torch.optim.Optimizer):
         self._prob_step = 0
         self._update_counter = 0
         self.rng = random.Random(5318008)
+        self.exact_hessian_vector_product = exact_hessian_vector_product
 
 
-    def get_hvps(self, grads, params):
-
-        # v = [2 * torch.randint_like(p, high=2) - 1 for p in params]
-        vs = [torch.randn_like(p) for p in params]
-        hvps = torch.autograd.grad(
-            grads,
-            params,
-            grad_outputs=vs,
-            only_inputs=True,
-            retain_graph=True)      
-        return hvps 
+    def get_hvps(self, grads, params, closure=None):
+        """Get Hessian-vector products either through exact computation or finite differences."""
+        if self.exact_hessian_vector_product:
+            # Exact HVP computation - use standard normal vectors
+            vs = [torch.randn_like(p) for p in params]
+            grad_v = sum((g * v).sum() for g, v in zip(grads, vs))
+            hvps = torch.autograd.grad(grad_v, params, create_graph=True)
+        else:
+            # Create a random number generator with fixed seed for this step
+            g = torch.Generator(device=params[0].device)
+            g.manual_seed(self._prob_step)  # Use step counter as seed
+            
+            # Finite difference approximation - use scaled vectors
+            delta_scale = max([torch.finfo(p.dtype).eps for p in params]) ** 0.5
+            vs = [delta_scale * torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=g) for p in params]
+            
+            # Add perturbation with grad tracking disabled
+            with torch.no_grad():
+                [p.add_(v) for p, v in zip(params, vs)]
+            
+            # Get perturbed gradients - no need to restore RNG state
+            with torch.enable_grad():
+                perturbed_loss = closure()
+                perturbed_grads = torch.autograd.grad(perturbed_loss, params)
+            
+            # Approximate HVPs as (perturbed_grad - grad)
+            hvps = [pg - g for pg, g in zip(perturbed_grads, grads)]
+            
+            # Always remove perturbation in finite difference case
+            with torch.no_grad():
+                [p.sub_(v) for p, v in zip(params, vs)]
+                
+        return hvps
 
     @torch.no_grad()
     def step(self, closure=None):
+        # Create a closure that recomputes the model's loss
+        if closure is None:
+            raise RuntimeError(
+                "Kron optimizer requires closure when exact_hessian_vector_product=False. "
+                "Please pass a closure to .step() that recomputes the model's loss."
+            )
 
-        loss = None
-        if closure is not None:
-          loss = closure()
-
+        # Compute initial loss and gradients
+        with torch.enable_grad():
+            loss = closure()
 
         params = []
         groups = []
         grads = []
-
+        
+        # Flatten groups into lists
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    params.append(p)
+                    groups.append(group)
+                    grads.append(p.grad.detach().clone())  # Store original gradients
+        
+        # Store closure for HVP computation
+        self._last_closure = closure
+        
         # Initialize tracking variables
         total_momentum_size = 0
         total_momentum_mb = 0
         total_precond_size = 0
         total_precond_mb = 0
-
-        # Flatten groups into lists, so that
-        #  hut_traces can be called with lists of parameters
-        #  and grads 
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is not None:
-                  params.append(p)
-                  groups.append(group)
-                  grads.append(p.grad)
 
         # Determine if we should update preconditioners
         update_prob = self.param_groups[0]["preconditioner_update_probability"]
@@ -162,7 +193,7 @@ class Kron(torch.optim.Optimizer):
             self._update_counter = 0
             # Only calculate HVPs if we're updating preconditioners
             with torch.enable_grad():
-                hvps = self.get_hvps(grads, params)
+                hvps = self.get_hvps(grads, params, closure)
         self._prob_step += 1
 
         # balance preconditioners roughly every 100 updates
