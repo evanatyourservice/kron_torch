@@ -4,8 +4,6 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 import time
 
-from kron_torch import Kron
-
 
 class ConvNet(nn.Module):
     def __init__(self):
@@ -61,7 +59,7 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
         optimizer.zero_grad()
         output = model(data)
         loss = F.nll_loss(output, target)
-        loss.backward()
+        loss.backward(create_graph=True)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
@@ -111,14 +109,6 @@ def main():
     model_sgd = ConvNet().to(device)
     model_sgd.load_state_dict(model_kron.state_dict())
 
-    if hasattr(torch, "compile"):
-        try:
-            model_kron = torch.compile(model_kron)
-            model_sgd = torch.compile(model_sgd)
-            print("Using compiled models")
-        except Exception as e:
-            print(f"Model compilation not supported on this system: {e}")
-
     print_model_summary(model_kron)
 
     print(f"Initial static param (Kron): {model_kron.static_param.item():.4f}")
@@ -126,11 +116,10 @@ def main():
 
     optimizer_kron = Kron(
         model_kron.parameters(),
-        lr=0.0001,
-        weight_decay=1e-6,
-        preconditioner_update_probability=1.0,
-        memory_save_mode="one_diag",
-    )
+        lr=0.01,
+        b1=0.9,
+        normalize_grads=True,
+        weight_decay=1e-6)
     optimizer_sgd = torch.optim.SGD(
         model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
     )
