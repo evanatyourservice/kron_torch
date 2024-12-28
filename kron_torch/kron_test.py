@@ -57,11 +57,13 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
         data, target = data.to(device), target.to(device)
 
         optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward(create_graph=True)
+        def closure():
+          output = model(data)
+          loss = F.nll_loss(output, target)
+          loss.backward(create_graph=True)
+          return loss 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        loss = optimizer.step(closure)
         scheduler.step()
 
         if batch_idx % 5 == 0:
@@ -119,7 +121,8 @@ def main():
         lr=0.01,
         b1=0.9,
         normalize_grads=True,
-        weight_decay=1e-6)
+        exact_hessian_vector_product = False,
+        weight_decay=1e-2)
     optimizer_sgd = torch.optim.SGD(
         model_sgd.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001
     )
