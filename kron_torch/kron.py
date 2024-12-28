@@ -136,6 +136,12 @@ class Kron(torch.optim.Optimizer):
         groups = []
         grads = []
 
+        # Initialize tracking variables
+        total_momentum_size = 0
+        total_momentum_mb = 0
+        total_precond_size = 0
+        total_precond_mb = 0
+
         # Flatten groups into lists, so that
         #  hut_traces can be called with lists of parameters
         #  and grads 
@@ -146,16 +152,7 @@ class Kron(torch.optim.Optimizer):
                   groups.append(group)
                   grads.append(p.grad)
 
-        # Enable gradient computation for HVP
-        with torch.enable_grad():
-          hvps = self.get_hvps(grads, params)
-
-        total_momentum_size = 0
-        total_momentum_mb = 0
-        total_precond_size = 0
-        total_precond_mb = 0
-
-        # update preconditioners all together deterministically
+        # Determine if we should update preconditioners
         update_prob = self.param_groups[0]["preconditioner_update_probability"]
         if callable(update_prob):
             update_prob = update_prob(self._prob_step)
@@ -163,13 +160,16 @@ class Kron(torch.optim.Optimizer):
         do_update = self._update_counter >= 1 / update_prob
         if do_update:
             self._update_counter = 0
+            # Only calculate HVPs if we're updating preconditioners
+            with torch.enable_grad():
+                hvps = self.get_hvps(grads, params)
         self._prob_step += 1
 
         # balance preconditioners roughly every 100 updates
         balance = self.rng.random() < 0.01 and do_update
 
 
-        for (p, group, grad, hvp) in zip(params, groups, grads, hvps):
+        for idx, (p, group, grad) in enumerate(zip(params, groups, grads)):
           
             mu_dtype = group.get("mu_dtype")
             precond_dtype = group.get("precond_dtype", torch.float32)
@@ -212,16 +212,16 @@ class Kron(torch.optim.Optimizer):
 
             state["step"] += 1
 
-            if group["normalize_grads"]:
-                hvp /= torch.norm(hvp) + 1e-12
-
-
-            # balance preconditioners about every 100 updates
-            if hvp.dim() > 1 and balance:
-                _balance_Q(state["Q"])
-
-            # Update preconditioner
+            # Only use HVPs when updating preconditioner
             if do_update:
+                hvp = hvps[idx]
+                if group["normalize_grads"]:
+                    hvp /= torch.norm(hvp) + 1e-12
+
+                # balance preconditioners about every 100 updates
+                if hvp.dim() > 1 and balance:
+                    _balance_Q(state["Q"])
+
                 _update_precond(
                     state["Q"],
                     state["exprs"],
