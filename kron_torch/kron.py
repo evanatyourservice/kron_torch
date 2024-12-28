@@ -4,6 +4,8 @@ import numpy as np
 import torch
 
 
+
+
 torch._dynamo.config.cache_size_limit = 1_000_000
 
 try:
@@ -11,7 +13,6 @@ try:
 except AttributeError:
     # opt_einsum backend is not available, so we'll skip setting the strategy
     pass
-
 
 def precond_update_prob_schedule(
     max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=500
@@ -110,12 +111,44 @@ class Kron(torch.optim.Optimizer):
         self._update_counter = 0
         self.rng = random.Random(5318008)
 
+
+    def get_hvps(self, grads, params):
+
+        # v = [2 * torch.randint_like(p, high=2) - 1 for p in params]
+        vs = [torch.randn_like(p) for p in params]
+        hvps = torch.autograd.grad(
+            grads,
+            params,
+            grad_outputs=vs,
+            only_inputs=True,
+            retain_graph=True)      
+        return hvps 
+
     @torch.no_grad()
     def step(self, closure=None):
+
         loss = None
         if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+          loss = closure()
+
+
+        params = []
+        groups = []
+        grads = []
+
+        # Flatten groups into lists, so that
+        #  hut_traces can be called with lists of parameters
+        #  and grads 
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                  params.append(p)
+                  groups.append(group)
+                  grads.append(p.grad)
+
+        # Enable gradient computation for HVP
+        with torch.enable_grad():
+          hvps = self.get_hvps(grads, params)
 
         total_momentum_size = 0
         total_momentum_mb = 0
@@ -135,95 +168,94 @@ class Kron(torch.optim.Optimizer):
         # balance preconditioners roughly every 100 updates
         balance = self.rng.random() < 0.01 and do_update
 
-        for group in self.param_groups:
+
+        for (p, group, grad, hvp) in zip(params, groups, grads, hvps):
+          
             mu_dtype = group.get("mu_dtype")
             precond_dtype = group.get("precond_dtype", torch.float32)
             momentum_into_precond_update = group.get(
                 "momentum_into_precond_update", True
             )
 
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
+            state = self.state[p]
 
-                grad = p.grad
-                state = self.state[p]
-
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["momentum_buffer"] = torch.zeros_like(
-                        p, dtype=mu_dtype or p.dtype
-                    )
-                    state["Q"], state["exprs"] = init_Q_exprs(
-                        p,
-                        group["precond_init_scale"],
-                        group["max_size_triangular"],
-                        group["min_ndim_triangular"],
-                        group["memory_save_mode"],
-                        dtype=precond_dtype,
-                    )
-
-                    # Print sizes
-                    momentum_size = state["momentum_buffer"].numel()
-                    momentum_mb = (
-                        momentum_size
-                        * state["momentum_buffer"].element_size()
-                        / (2**20)
-                    )
-                    total_momentum_size += momentum_size
-                    total_momentum_mb += momentum_mb
-
-                    precond_size = sum(q.numel() for q in state["Q"])
-                    precond_mb = sum(
-                        q.numel() * q.element_size() for q in state["Q"]
-                    ) / (2**20)
-                    total_precond_size += precond_size
-                    total_precond_mb += precond_mb
-
-                state["step"] += 1
-
-                if group["normalize_grads"]:
-                    grad /= torch.norm(grad) + 1e-12
-
-                # Update momentum buffer
-                beta = group["b1"]
-                bias_correction = 1 - beta ** state["step"]
-                momentum_buffer = state["momentum_buffer"]
-                momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
-                # Restore momentum dtype
-                if mu_dtype is not None:
-                    momentum_buffer.copy_(
-                        momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
-                    )
-                debiased_momentum = momentum_buffer / bias_correction
-                debiased_momentum = debiased_momentum.to(
-                    dtype=precond_dtype, non_blocking=True
+            if len(state) == 0:
+                state["step"] = 0
+                state["momentum_buffer"] = torch.zeros_like(
+                    p, dtype=mu_dtype or p.dtype
+                )
+                state["Q"], state["exprs"] = init_Q_exprs(
+                    p,
+                    group["precond_init_scale"],
+                    group["max_size_triangular"],
+                    group["min_ndim_triangular"],
+                    group["memory_save_mode"],
+                    dtype=precond_dtype,
                 )
 
-                # balance preconditioners about every 100 updates
-                if grad.dim() > 1 and balance:
-                    _balance_Q(state["Q"])
+                # Print sizes
+                momentum_size = state["momentum_buffer"].numel()
+                momentum_mb = (
+                    momentum_size
+                    * state["momentum_buffer"].element_size()
+                    / (2**20)
+                )
+                total_momentum_size += momentum_size
+                total_momentum_mb += momentum_mb
 
-                # Update preconditioner
-                if do_update:
-                    _update_precond(
-                        state["Q"],
-                        state["exprs"],
-                        torch.randn_like(debiased_momentum, dtype=precond_dtype),
-                        debiased_momentum if momentum_into_precond_update else grad,
-                        group["precond_lr"],
-                        self._tiny,
-                    )
+                precond_size = sum(q.numel() for q in state["Q"])
+                precond_mb = sum(
+                    q.numel() * q.element_size() for q in state["Q"]
+                ) / (2**20)
+                total_precond_size += precond_size
+                total_precond_mb += precond_mb
 
-                # Precondition gradients
-                pre_grad = _precond_grad(
-                    state["Q"], state["exprs"], debiased_momentum
-                ).to(dtype=p.dtype, non_blocking=True)
+            state["step"] += 1
 
-                # Apply weight decay and update parameters
-                if group["weight_decay"] != 0 and p.dim() >= 2:
-                    pre_grad.add_(p, alpha=group["weight_decay"])
-                p.add_(pre_grad, alpha=-group["lr"])
+            if group["normalize_grads"]:
+                hvp /= torch.norm(hvp) + 1e-12
+
+
+            # balance preconditioners about every 100 updates
+            if hvp.dim() > 1 and balance:
+                _balance_Q(state["Q"])
+
+            # Update preconditioner
+            if do_update:
+                _update_precond(
+                    state["Q"],
+                    state["exprs"],
+                    torch.randn_like(hvp, dtype=precond_dtype),
+                    hvp,
+                    group["precond_lr"],
+                    self._tiny,
+                )
+
+            # Precondition gradients
+            pre_grad = _precond_grad(
+                state["Q"], state["exprs"], grad
+            ).to(dtype=p.dtype, non_blocking=True)
+
+            # Update momentum buffer
+            beta = group["b1"]
+            bias_correction = 1 - beta ** state["step"]
+            momentum_buffer = state["momentum_buffer"]
+            momentum_buffer.mul_(group["b1"]).add_(pre_grad, alpha=1 - group["b1"])
+            # Restore momentum dtype
+            if mu_dtype is not None:
+                momentum_buffer.copy_(
+                    momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
+                )
+            debiased_momentum = momentum_buffer / bias_correction
+            debiased_momentum = debiased_momentum.to(
+                dtype=precond_dtype, non_blocking=True
+            )
+
+
+            # Apply weight decay and update parameters
+            if group["weight_decay"] != 0 and p.dim() >= 2:
+                debiased_momentum.add_(p, alpha=group["weight_decay"])
+            p.add_(debiased_momentum, alpha=-group["lr"])
 
         if total_momentum_size > 0:
             print(
@@ -344,7 +376,6 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
     return [Q, (exprA, exprGs, exprP)]
 
 
-@torch.compile(fullgraph=True, dynamic=False)
 def _balance_Q(Q_in):
     norms = torch.stack([q.norm(float("inf")) for q in Q_in])
     geometric_mean = norms.prod() ** (1 / len(Q_in))
@@ -386,7 +417,6 @@ def _solve_triangular_right(X, A):
     )[0]
 
 
-@torch.compile(fullgraph=True, dynamic=False)
 def _calc_A_and_conjB(exprA, G, Q, V):
     A = torch.einsum(exprA, *Q, G)
     order = G.dim()
@@ -399,7 +429,6 @@ def _calc_A_and_conjB(exprA, G, Q, V):
     return A, conjB
 
 
-@torch.compile(fullgraph=True, dynamic=False)
 def _q_terms(exprGs, A, conjB):
     terms = []
     for exprG in exprGs:
@@ -431,7 +460,6 @@ def _update_precond(Q, exprs, V, G, step, tiny):
             q.sub_(tmp)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
 def _precond_grad(Q, exprs, G):
     """Precondition gradient G with preconditioner Q."""
     return torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
