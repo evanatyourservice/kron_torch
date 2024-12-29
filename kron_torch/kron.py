@@ -219,7 +219,7 @@ class Kron(torch.optim.Optimizer):
                 beta = group["b1"]
                 bias_correction = 1 - beta ** state["step"]
                 momentum_buffer = state["momentum_buffer"]
-                momentum_buffer.mul_(group["b1"]).add_(pre_grad, alpha=1 - group["b1"])
+                momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
                 # Restore momentum dtype
                 if mu_dtype is not None:
                     momentum_buffer.copy_(
