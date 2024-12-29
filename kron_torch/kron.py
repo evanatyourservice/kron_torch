@@ -213,7 +213,8 @@ class Kron(torch.optim.Optimizer):
                 state["step"] += 1
                 
                 if group["normalize_grads"]:
-                    grad /= torch.norm(grad) + 1e-12            
+                    grad /= torch.norm(grad) + 1e-12      
+                          
                 # Update momentum buffer
                 beta = group["b1"]
                 bias_correction = 1 - beta ** state["step"]
@@ -235,18 +236,18 @@ class Kron(torch.optim.Optimizer):
                     if group["normalize_grads"]:
                         hvp /= torch.norm(hvp) + 1e-12
 
-                # balance preconditioners about every 100 updates
-                if hvp.dim() > 1 and balance:
-                    _balance_Q(state["Q"])
+                    # balance preconditioners about every 100 updates
+                    if hvp.dim() > 1 and balance:
+                        _balance_Q(state["Q"])
 
-                _update_precond(
-                    state["Q"],
-                    state["exprs"],
-                    torch.randn_like(hvp, dtype=precond_dtype),
-                    hvp,
-                    group["precond_lr"],
-                    self._tiny,
-                )
+                    _update_precond(
+                        state["Q"],
+                        state["exprs"],
+                        torch.randn_like(hvp, dtype=precond_dtype),
+                        hvp,
+                        group["precond_lr"],
+                        self._tiny,
+                    )
 
             # Precondition gradients
             pre_grad = _precond_grad(
