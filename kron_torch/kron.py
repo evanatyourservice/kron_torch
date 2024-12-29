@@ -210,44 +210,44 @@ class Kron(torch.optim.Optimizer):
                 total_precond_size += precond_size
                 total_precond_mb += precond_mb
     
-                state["step"] += 1
-                
-                if group["normalize_grads"]:
-                    grad /= torch.norm(grad) + 1e-12      
-                          
-                # Update momentum buffer
-                beta = group["b1"]
-                bias_correction = 1 - beta ** state["step"]
-                momentum_buffer = state["momentum_buffer"]
-                momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
-                # Restore momentum dtype
-                if mu_dtype is not None:
-                    momentum_buffer.copy_(
-                        momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
-                    )
-                debiased_momentum = momentum_buffer / bias_correction
-                debiased_momentum = debiased_momentum.to(
-                    dtype=precond_dtype, non_blocking=True
+            state["step"] += 1
+            
+            if group["normalize_grads"]:
+                grad /= torch.norm(grad) + 1e-12      
+                        
+            # Update momentum buffer
+            beta = group["b1"]
+            bias_correction = 1 - beta ** state["step"]
+            momentum_buffer = state["momentum_buffer"]
+            momentum_buffer.mul_(group["b1"]).add_(grad, alpha=1 - group["b1"])
+            # Restore momentum dtype
+            if mu_dtype is not None:
+                momentum_buffer.copy_(
+                    momentum_buffer.to(dtype=mu_dtype, non_blocking=True)
                 )
-                
-                # Only use HVPs when updating preconditioner
-                if do_update:
-                    hvp = hvps[idx]
-                    if group["normalize_grads"]:
-                        hvp /= torch.norm(hvp) + 1e-12
+            debiased_momentum = momentum_buffer / bias_correction
+            debiased_momentum = debiased_momentum.to(
+                dtype=precond_dtype, non_blocking=True
+            )
+            
+            # Only use HVPs when updating preconditioner
+            if do_update:
+                hvp = hvps[idx]
+                if group["normalize_grads"]:
+                    hvp /= torch.norm(hvp) + 1e-12
 
-                    # balance preconditioners about every 100 updates
-                    if hvp.dim() > 1 and balance:
-                        _balance_Q(state["Q"])
+                # balance preconditioners about every 100 updates
+                if hvp.dim() > 1 and balance:
+                    _balance_Q(state["Q"])
 
-                    _update_precond(
-                        state["Q"],
-                        state["exprs"],
-                        torch.randn_like(hvp, dtype=precond_dtype),
-                        hvp,
-                        group["precond_lr"],
-                        self._tiny,
-                    )
+                _update_precond(
+                    state["Q"],
+                    state["exprs"],
+                    torch.randn_like(hvp, dtype=precond_dtype),
+                    hvp,
+                    group["precond_lr"],
+                    self._tiny,
+                )
 
             # Precondition gradients
             pre_grad = _precond_grad(
