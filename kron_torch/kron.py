@@ -241,16 +241,11 @@ class Kron(torch.optim.Optimizer):
                 total_precond_size += precond_size
                 total_precond_mb += precond_mb
 
-            # Only use HVPs when updating preconditioner
-            if do_update:
-                hvp = hvps[idx]
-                if group["normalize_grads"]:
-                    hvp /= torch.norm(hvp) + 1e-12
-                    # TODO: test what happens if we only normalize hvps or only grads? 
-                    grad /= torch.norm(grad) + 1e-12
-            
             state["step"] += 1
-            
+
+            if group["normalize_grads"]:
+                grad /= torch.norm(grad) + 1e-12
+
             # Update momentum buffer
             beta = group["b1"]
             bias_correction = 1 - beta ** state["step"]
@@ -265,6 +260,13 @@ class Kron(torch.optim.Optimizer):
             debiased_momentum = debiased_momentum.to(
                 dtype=precond_dtype, non_blocking=True
             )
+
+
+            # Only use HVPs when updating preconditioner
+            if do_update:
+                hvp = hvps[idx]
+                if group["normalize_grads"]:
+                    hvp /= torch.norm(hvp) + 1e-12
 
                 # balance preconditioners about every 100 updates
                 if hvp.dim() > 1 and balance:
