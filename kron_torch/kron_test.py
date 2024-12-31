@@ -11,27 +11,21 @@ class ConvNet(nn.Module):
     def __init__(self):
         super(ConvNet, self).__init__()
         self.scalar = nn.Parameter(torch.ones(1))
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
-        self.ln1 = nn.LayerNorm([16, 28, 28])
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.ln2 = nn.LayerNorm([32, 28, 28])
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.ln3 = nn.LayerNorm([64, 14, 14])
-        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.ln4 = nn.LayerNorm([128, 7, 7])
-        self.fc1 = nn.Linear(128 * 7 * 7, 128)
-        self.ln5 = nn.LayerNorm(128)
-        self.fc2 = nn.Linear(128, 10)
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=3, padding=1)
+        self.ln1 = nn.LayerNorm([8, 28, 28])
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
+        self.ln2 = nn.LayerNorm([16, 14, 14])
+        self.fc1 = nn.Linear(16 * 14 * 14, 64)
+        self.ln3 = nn.LayerNorm(64)
+        self.fc2 = nn.Linear(64, 10)
         self.static_param = nn.Parameter(torch.randn(1), requires_grad=False)
 
     def forward(self, x):
         x = self.scalar * x
         x = F.relu(self.ln1(self.conv1(x)))
-        x = F.relu(self.ln2(self.conv2(x)))
-        x = F.relu(self.ln3(self.conv3(F.max_pool2d(x, 2))))
-        x = F.relu(self.ln4(self.conv4(F.max_pool2d(x, 2))))
-        x = x.view(-1, 128 * 7 * 7)
-        x = F.relu(self.ln5(self.fc1(x)))
+        x = F.relu(self.ln2(self.conv2(F.max_pool2d(x, 2))))
+        x = x.view(-1, 16 * 14 * 14)
+        x = F.relu(self.ln3(self.fc1(x)))
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
 
@@ -66,7 +60,7 @@ def train(model, device, train_loader, optimizer, scheduler, epoch):
         optimizer.step()
         scheduler.step()
 
-        if batch_idx % 5 == 0:
+        if batch_idx % 10 == 0:
             print(
                 f"Epoch: {epoch}, Batch: {batch_idx + 1}/{num_batches}, "
                 f"Loss: {loss.item():.6f}"
@@ -88,7 +82,7 @@ def main():
         num_workers = 4
         pin_memory = True
     else:
-        num_workers = 0  # Use 0 workers for CPU to avoid overhead
+        num_workers = 0
         pin_memory = False
 
     transform = transforms.Compose(
@@ -101,10 +95,10 @@ def main():
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=16,
+        batch_size=8,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        num_workers=0,
+        pin_memory=False,
     )
 
     model_kron = ConvNet().to(device)
