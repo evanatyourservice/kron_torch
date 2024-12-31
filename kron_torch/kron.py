@@ -6,12 +6,6 @@ import torch
 
 torch._dynamo.config.cache_size_limit = 1_000_000
 
-try:
-    torch.backends.opt_einsum.strategy = "dynamic-programming"
-except AttributeError:
-    # opt_einsum backend is not available, so we'll skip setting the strategy
-    pass
-
 
 def precond_update_prob_schedule(
     max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=500
@@ -45,7 +39,6 @@ class Kron(torch.optim.Optimizer):
             parameter groups.
         lr (float): Learning rate.
         b1 (float): Momentum parameter.
-        normalize_grads (bool): Whether to normalize incoming gradients layer-wise.
         weight_decay (float): Weight decay (L2 penalty).
         preconditioner_update_probability (callable or float, optional): Probability of
             updating the preconditioner. If None, defaults to a schedule that anneals
@@ -68,7 +61,6 @@ class Kron(torch.optim.Optimizer):
         params,
         lr=0.001,
         b1=0.9,
-        normalize_grads=False,
         weight_decay=0.0,
         preconditioner_update_probability=None,
         max_size_triangular=8192,
@@ -91,7 +83,6 @@ class Kron(torch.optim.Optimizer):
         defaults = dict(
             lr=lr,
             b1=b1,
-            normalize_grads=normalize_grads,
             weight_decay=weight_decay,
             preconditioner_update_probability=preconditioner_update_probability,
             max_size_triangular=max_size_triangular,
@@ -154,7 +145,7 @@ class Kron(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(
                         p, dtype=mu_dtype or p.dtype
                     )
-                    state["Q"], state["exprs"] = init_Q_exprs(
+                    state["Q"], state["exprs"] = _init_Q_exprs(
                         p,
                         group["precond_init_scale"],
                         group["max_size_triangular"],
@@ -181,9 +172,6 @@ class Kron(torch.optim.Optimizer):
                     total_precond_mb += precond_mb
 
                 state["step"] += 1
-
-                if group["normalize_grads"]:
-                    grad /= torch.norm(grad) + 1e-12
 
                 # Update momentum buffer
                 beta = group["b1"]
@@ -220,6 +208,13 @@ class Kron(torch.optim.Optimizer):
                     state["Q"], state["exprs"], debiased_momentum
                 ).to(dtype=p.dtype, non_blocking=True)
 
+                # RMS of pre_grad should be 1.0, so let's cap at 1.1
+                pre_grad.mul_(
+                    torch.clamp(
+                        1.1 / (pre_grad.square().mean().sqrt() + 1e-6), max=1.0
+                    )
+                )
+
                 # Apply weight decay and update parameters
                 if group["weight_decay"] != 0 and p.dim() >= 2:
                     pre_grad.add_(p, alpha=group["weight_decay"])
@@ -238,7 +233,7 @@ class Kron(torch.optim.Optimizer):
         return loss
 
 
-def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtype=None):
+def _init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtype=None):
     """For a scalar or tensor t, we initialize its preconditioner Q and
     reusable einsum expressions for updating Q and preconditioning gradient.
     """
