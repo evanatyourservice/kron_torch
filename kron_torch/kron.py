@@ -376,8 +376,10 @@ def _solve_triangular_right(X, A):
     orig_dtype = X.dtype
     X = X.to(dtype=torch.float32, non_blocking=True)
     A = A.to(dtype=torch.float32, non_blocking=True)
-    return torch.linalg.solve_triangular(A, X.reshape(-1, q.size(0)), upper=True, left=False).reshape_as(X)
-    
+    out = torch.linalg.solve_triangular(
+        A, X.reshape(-1, X.size(-1)), upper=True, left=False
+    ).reshape_as(X)
+    return out.to(dtype=orig_dtype, non_blocking=True)
 
 @torch.compile(fullgraph=True, dynamic=False)
 def _calc_A_and_conjB(exprA, G, Q, V):
