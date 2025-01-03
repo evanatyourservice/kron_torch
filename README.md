@@ -4,7 +4,7 @@ For original PSGD repo, see [psgd_torch](https://github.com/lixilinx/psgd_torch)
 
 For JAX version, see [psgd_jax](https://github.com/evanatyourservice/psgd_jax).
 
-Implementations of [PSGD optimizers](https://github.com/lixilinx/psgd_torch) in JAX (optax-style). 
+Implementation of PSGD Kron for PyTorch. 
 PSGD is a second-order optimizer originally created by Xi-Lin Li that uses either a hessian-based 
 or whitening-based (gg^T) preconditioner and lie groups to improve training convergence, 
 generalization, and efficiency. I highly suggest taking a look at Xi-Lin's PSGD repo's readme linked
@@ -43,8 +43,7 @@ optimizer.step()
 
 **Basic hyperparameters:**
 
-TLDR: Learning rate and weight decay act similarly to adam's, start with adam-like settings and go 
-from there. Maybe use slightly lower learning rate (like /2). There is no b2 or epsilon.
+TLDR: Start with a learning rate around 3x smaller than adam's. There is no b2 or epsilon.
 
 These next 3 settings control whether a dimension's preconditioner is diagonal or triangular. 
 For example, for a layer with shape (256, 128), triagular preconditioners would be shapes (256, 256)
