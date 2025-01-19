@@ -260,6 +260,11 @@ def _init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dty
             rev_sorted_dims = np.argsort(shape)[::-1]
             dim_diag = [False for _ in shape]
             dim_diag[rev_sorted_dims[0]] = True
+        elif memory_save_mode == "smart_one_diag":
+            dim_diag = [False for _ in shape]
+            sorted_shape = sorted(shape)
+            if len(shape) >= 2 and sorted_shape[-1] > sorted_shape[-2]:
+                dim_diag[np.argsort(shape)[::-1][0] = True
         elif memory_save_mode == "all_diag":
             dim_diag = [True for _ in shape]
         else:
