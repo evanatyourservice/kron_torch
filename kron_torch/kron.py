@@ -16,7 +16,7 @@ def precond_update_prob_schedule(
     but once the preconditioner is learned the update probability can drop low.
 
     This schedule is an exponential anneal with a flat start. Default settings keep
-    update probability at 1.0 for 200 steps then exponentially anneal down to
+    update probability at 1.0 for 500 steps then exponentially anneal down to
     `min_prob` by 4000 steps. Default settings work very well for most models and
     training regimes.
     """
@@ -39,7 +39,7 @@ class Kron(torch.optim.Optimizer):
             parameter groups.
         lr (float): Learning rate.
         b1 (float): Momentum parameter.
-        weight_decay (float): Weight decay (L2 penalty).
+        weight_decay (float): Weight decay.
         preconditioner_update_probability (callable or float, optional): Probability of
             updating the preconditioner. If None, defaults to a schedule that anneals
             from 1.0 to 0.03 by 4000 steps.
@@ -59,7 +59,7 @@ class Kron(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr=0.001,
+        lr=0.0003,
         b1=0.9,
         weight_decay=0.0,
         preconditioner_update_probability=None,
