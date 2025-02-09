@@ -33,7 +33,8 @@ classifiers = [
 ]
 dependencies = [
     "torch",
-    "triton"
+    "triton",
+    "opt-einsum",
 ]
 
 [project.urls]

@@ -171,3 +171,4 @@ training_loss.png
 
 scratch
 /data
+/kron_torch/data

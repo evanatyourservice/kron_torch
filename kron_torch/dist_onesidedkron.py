@@ -105,9 +105,6 @@ class OneSidedKron(torch.optim.Optimizer):
         )
         super().__init__(param_groups, defaults)
 
-        self._weight_decay = torch.tensor(weight_decay, dtype=dtype, device="cuda")
-        self._beta = torch.tensor(b1, dtype=dtype, device="cuda")
-        self._precond_lr = torch.tensor(precond_lr, dtype=dtype, device="cuda")
         self._tiny = torch.tensor(torch.finfo(dtype).tiny, dtype=dtype, device="cuda")
         self._prob_step = torch.tensor(0, dtype=torch.int32)
         self._update_counter = torch.tensor(0, dtype=torch.int32)
@@ -147,7 +144,7 @@ class OneSidedKron(torch.optim.Optimizer):
                     _update_params(
                         params_world,
                         updates,
-                        self._weight_decay,
+                        torch.tensor(group["weight_decay"], dtype=self.dtype, device="cuda"),
                         torch.tensor(group["lr"], dtype=self.dtype, device="cuda"),
                     )
                     pending_update = False
@@ -170,11 +167,18 @@ class OneSidedKron(torch.optim.Optimizer):
                         )
                         state["step"] = torch.tensor(0, dtype=torch.int32, device="cuda")
                     state["step"] += 1
-                    g = _update_momentum(state["momentum_buffer"], g, self._beta, state["step"])
+                    g = _update_momentum(
+                        state["momentum_buffer"],
+                        g,
+                        torch.tensor(group["b1"], dtype=self.dtype, device="cuda"),
+                        state["step"]
+                    )
 
                     if do_update:
                         state["Q"] = _oneside_precond_update(
-                            g.view(-1, g.shape[-1]), state["Q"], self._precond_lr
+                            g.view(-1, g.shape[-1]),
+                            state["Q"],
+                            torch.tensor(group["precond_lr"], dtype=self.dtype, device="cuda"),
                         )
                     g = _oneside_precond_g(g.view(-1, g.shape[-1]), state["Q"])
                     if group["clip_update_rms"]:

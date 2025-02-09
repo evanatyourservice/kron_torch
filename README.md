@@ -57,9 +57,10 @@ to most precoditioners being triangular except for 1-dimensional layers and very
 preconditioners. Default is 2, so single-dim layers like bias and scale will use diagonal
 preconditioners.
 
-`memory_save_mode`: Can be None, 'one_diag', or 'all_diag'. None is default and lets all 
-preconditioners be triangular. 'one_diag' sets the largest or last dim per layer as diagonal 
-using `np.argsort(shape)[::-1][0]`. 'all_diag' sets all preconditioners to be diagonal.
+`memory_save_mode`: Can be None, 'smart_one_diag', 'one_diag', or 'all_diag'. None is default and lets all 
+preconditioners be triangular. 'smart_one_diag' sets the largest dim to diagonal only if it's larger than
+the second largest dim (if it stands out). 'one_diag' sets the largest or last dim per layer as diagonal using 
+`np.argsort(shape)[::-1][0]`. 'all_diag' sets all preconditioners to be diagonal.
 
 `preconditioner_update_probability`: Preconditioner update probability uses a schedule by default 
 that works well for most cases. It anneals from 1 to 0.03 at the beginning of training, so training 

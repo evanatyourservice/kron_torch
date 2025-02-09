@@ -118,9 +118,6 @@ class Kron(torch.optim.Optimizer):
         )
         super().__init__(param_groups, defaults)
 
-        self._weight_decay = torch.tensor(weight_decay, dtype=dtype, device="cuda")
-        self._beta = torch.tensor(b1, dtype=dtype, device="cuda")
-        self._precond_lr = torch.tensor(precond_lr, dtype=dtype, device="cuda")
         self._tiny = torch.tensor(torch.finfo(dtype).tiny, dtype=dtype, device="cuda")
         self._prob_step = torch.tensor(0, dtype=torch.int32)
         self._update_counter = torch.tensor(0, dtype=torch.int32)
@@ -163,7 +160,7 @@ class Kron(torch.optim.Optimizer):
                     _update_params(
                         params_world,
                         updates,
-                        self._weight_decay,
+                        torch.tensor(group["weight_decay"], dtype=self.dtype, device="cuda"),
                         torch.tensor(group["lr"], dtype=self.dtype, device="cuda"),
                     )
                     pending_update = False
@@ -183,11 +180,9 @@ class Kron(torch.optim.Optimizer):
                     # merge smaller dims
                     if grads.dim() > 1:
                         if "step" not in state:
-                            shape = (
-                                [np.prod(grads.shape[:-1]), grads.shape[-1]]
-                                if np.diff([np.prod(grads.shape[:-1]), grads.shape[-1]]) <= np.diff([grads.shape[0], np.prod(grads.shape[1:])])
-                                else [grads.shape[0], np.prod(grads.shape[1:])]
-                            )
+                            shape1 = [np.prod(grads.shape[:-1]), grads.shape[-1]]
+                            shape2 = [grads.shape[0], np.prod(grads.shape[1:])]
+                            shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
                             state["merged_shape"] = shape
                         grads = grads.view(*state["merged_shape"])
 
@@ -233,7 +228,7 @@ class Kron(torch.optim.Optimizer):
                         debiased_momentum = _update_momentum(
                             state[f"momentum_buffer_{i}"],
                             grad,
-                            self._beta,
+                            torch.tensor(group["b1"], dtype=self.dtype, device="cuda"),
                             torch.tensor(state[f"step_{i}"], dtype=self.dtype, device="cuda"),
                         )
 
@@ -245,7 +240,7 @@ class Kron(torch.optim.Optimizer):
                                 state[f"Q_{i}"],
                                 state[f"exprs_{i}"],
                                 debiased_momentum,
-                                self._precond_lr,
+                                torch.tensor(group["precond_lr"], dtype=self.dtype, device="cuda"),
                                 self._tiny,
                             )
 
