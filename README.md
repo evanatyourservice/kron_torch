@@ -1,8 +1,9 @@
 # PSGD Kron
 
-For original PSGD repo, see [psgd_torch](https://github.com/lixilinx/psgd_torch).
+For Xi-Lin's original PSGD repo, see [psgd_torch](https://github.com/lixilinx/psgd_torch).
 
-For JAX version, see [psgd_jax](https://github.com/evanatyourservice/psgd_jax).
+For JAX versions, see [psgd_jax](https://github.com/evanatyourservice/psgd_jax) and 
+[distributed_kron](https://github.com/evanatyourservice/distributed_kron).
 
 Implementation of PSGD Kron for PyTorch. 
 PSGD is a second-order optimizer originally created by Xi-Lin Li that uses either a hessian-based 
@@ -16,6 +17,13 @@ paper resources listed near the bottom of this readme.
 The most versatile and easy-to-use PSGD optimizer is `kron`, which uses a Kronecker-factored 
 preconditioner. It has less hyperparameters that need tuning than adam, and can generally act as a 
 drop-in replacement.
+
+### Thanks
+
+Shoutout to @ClashLuke for developing efficiency improvements for PSGD Kron in the 
+[heavyball](https://github.com/HomebrewML/HeavyBall) repo, and for the design of 'smart_one_diag' memory
+save mode, which is a method to improve memory usage and speed with almost no cost to the optimizer's
+effectiveness. In Xi-Lin's repo, the equivalent is setting `preconditioner_max_skew=1`.
 
 ## Installation
 

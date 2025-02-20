@@ -279,7 +279,7 @@ def _update_momentum(momentum_buffer, grad, beta, step):
 def _get_dim_diag(memory_save_mode, shape, max_size, min_ndim):
     if memory_save_mode is None:
         dim_diag = [False for _ in shape]
-    elif memory_save_mode == "smart_one_diag":
+    elif memory_save_mode == "smart_one_diag":  # Thanks to @ClashLuke heavyball repo
         rev_sorted_dims = np.argsort(shape)[::-1]
         dim_diag = [False for _ in shape]
         sorted_shape = sorted(shape)
@@ -429,7 +429,10 @@ def _calc_A_and_conjB(exprA, G, Q):
 
 @torch.compile
 def _update_precond(Q, exprs, G, step, tiny):
-    """Update Kronecker product preconditioner Q with pair (V, G)."""
+    """Update Kronecker product preconditioner Q with pair (V, G).
+    
+    Thanks to @ClashLuke heavyball repo for many of the optimizations in this function.
+    """
     exprA, exprGs, _ = exprs
     A, conjB = _calc_A_and_conjB(exprA, G, Q)
     for q, exprG in zip(Q, exprGs):
