@@ -47,6 +47,7 @@ class OneSidedKron(torch.optim.Optimizer):
         preconditioner_update_probability: Prob of updating preconditioner (default: anneals 1.0->0.03 by 4000 steps)
         precond_lr: Preconditioner learning rate (default: 0.1)
         clip_update_rms: Clip update RMS at 1.1
+        merge_dims: Whether to combine dims to make grad tensor a matrix
         dtype: Data type for params/grads
         rank: Worker rank for pipeline
         world_size: Total workers for pipeline
@@ -61,6 +62,7 @@ class OneSidedKron(torch.optim.Optimizer):
         preconditioner_update_probability=None,
         precond_lr=0.1,
         clip_update_rms=True,
+        merge_dims=True,
         dtype=torch.float32,
         rank=0,
         world_size=1,
@@ -101,6 +103,7 @@ class OneSidedKron(torch.optim.Optimizer):
             preconditioner_update_probability=preconditioner_update_probability,
             precond_lr=precond_lr,
             clip_update_rms=clip_update_rms,
+            merge_dims=merge_dims,
             dtype=dtype,
         )
         super().__init__(param_groups, defaults)
@@ -160,11 +163,18 @@ class OneSidedKron(torch.optim.Optimizer):
 
                     g = p.grad.to(self.dtype)
                     state = self.state[p]
+
+                    if g.dim() > 2 and group.get('merge_dims', True):
+                        if "merged_shape" not in state:
+                            shape1 = [np.prod(g.shape[:-1]), g.shape[-1]]
+                            shape2 = [g.shape[0], np.prod(g.shape[1:])]
+                            shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
+                            state["merged_shape"] = shape
+                        g = g.view(*state["merged_shape"])
+
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
-                        state["Q"] = torch.eye(
-                            min(g.view(-1, g.shape[-1]).shape), dtype=self.dtype, device=g.device
-                        )
+                        state["Q"] = torch.eye(min(g.shape), dtype=self.dtype, device=g.device)
                         state["step"] = torch.tensor(0, dtype=torch.int32, device="cuda")
                     state["step"] += 1
                     g = _update_momentum(
@@ -176,11 +186,11 @@ class OneSidedKron(torch.optim.Optimizer):
 
                     if do_update:
                         state["Q"] = _oneside_precond_update(
-                            g.view(-1, g.shape[-1]),
+                            g,
                             state["Q"],
                             torch.tensor(group["precond_lr"], dtype=self.dtype, device="cuda"),
                         )
-                    g = _oneside_precond_g(g.view(-1, g.shape[-1]), state["Q"])
+                    g = _oneside_precond_g(g, state["Q"])
                     if group["clip_update_rms"]:
                         _clip_update_rms(g)
                     g = g.flatten()

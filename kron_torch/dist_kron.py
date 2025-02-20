@@ -56,6 +56,7 @@ class Kron(torch.optim.Optimizer):
             'all_diag': All diagonal preconditioners
         precond_lr: Preconditioner learning rate (default: 0.1)
         precond_init_scale: Initial preconditioner scale (default: 1.0)
+        merge_dims: Whether to combine dims to make grad tensor a matrix
         partition_grads: Whether to partition gradients
         block_size: Partition size for gradients
         clip_update_rms: Clip update RMS at 1.1
@@ -76,6 +77,7 @@ class Kron(torch.optim.Optimizer):
         memory_save_mode=None,
         precond_lr=0.1,
         precond_init_scale=1.0,
+        merge_dims=True,
         partition_grads=False,
         block_size=1024,
         clip_update_rms=True,
@@ -111,6 +113,7 @@ class Kron(torch.optim.Optimizer):
             memory_save_mode=memory_save_mode,
             precond_lr=precond_lr,
             precond_init_scale=precond_init_scale,
+            merge_dims=merge_dims,
             partition_grads=partition_grads,
             block_size=block_size,
             clip_update_rms=clip_update_rms,
@@ -178,8 +181,8 @@ class Kron(torch.optim.Optimizer):
                     state = self.state[p]
 
                     # merge smaller dims
-                    if grads.dim() > 1:
-                        if "step" not in state:
+                    if grads.dim() > 2 and group.get('merge_dims', True):
+                        if "merged_shape" not in state:
                             shape1 = [np.prod(grads.shape[:-1]), grads.shape[-1]]
                             shape2 = [grads.shape[0], np.prod(grads.shape[1:])]
                             shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2

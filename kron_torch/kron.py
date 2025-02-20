@@ -57,6 +57,7 @@ class Kron(torch.optim.Optimizer):
             update instead of raw gradients.
         precond_lr (float): Learning rate for preconditioner.
         precond_init_scale (float): Initial scale for preconditioners.
+        merge_dims (bool): Whether to combine dims to make grad tensor a matrix.
         mu_dtype (torch.dtype, optional): Dtype of the momentum accumulator.
         precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
     """
@@ -74,6 +75,7 @@ class Kron(torch.optim.Optimizer):
         momentum_into_precond_update=True,
         precond_lr=0.1,
         precond_init_scale=1.0,
+        merge_dims=True,
         mu_dtype=None,
         precond_dtype=None,
     ):
@@ -91,6 +93,7 @@ class Kron(torch.optim.Optimizer):
             momentum_into_precond_update=momentum_into_precond_update,
             precond_lr=precond_lr,
             precond_init_scale=precond_init_scale,
+            merge_dims=merge_dims,
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
         )
@@ -141,9 +144,16 @@ class Kron(torch.optim.Optimizer):
 
                 if len(state) == 0:
                     state["step"] = 0
-                    state["momentum_buffer"] = torch.zeros_like(p, dtype=mu_dtype or p.dtype)
+                    # merge smaller dims
+                    if grad.dim() > 2 and group.get('merge_dims', True):
+                        shape1 = [np.prod(grad.shape[:-1]), grad.shape[-1]]
+                        shape2 = [grad.shape[0], np.prod(grad.shape[1:])]
+                        shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
+                        state["merged_shape"] = shape
+                        grad = grad.view(*shape)
+                    state["momentum_buffer"] = torch.zeros_like(grad, dtype=mu_dtype or p.dtype)
                     state["Q"], state["exprs"] = _init_Q_exprs(
-                        p,
+                        grad,
                         group["precond_init_scale"],
                         group["max_size_triangular"],
                         group["min_ndim_triangular"],
@@ -162,6 +172,10 @@ class Kron(torch.optim.Optimizer):
                     total_precond_mb += precond_mb
 
                 state["step"] += 1
+
+                # merge smaller dims
+                if "merged_shape" in state:
+                    grad = grad.view(*state["merged_shape"])
 
                 beta = group["b1"]
                 momentum_buffer = state["momentum_buffer"]
@@ -193,6 +207,7 @@ class Kron(torch.optim.Optimizer):
                 _clip_update_rms(pre_grad)
 
                 # apply weight decay and update parameters
+                pre_grad = pre_grad.view(p.shape)
                 if group["weight_decay"] != 0 and p.dim() >= 2:
                     pre_grad.add_(p, alpha=group["weight_decay"])
                 p.add_(pre_grad.to(dtype=p.dtype), alpha=-group["lr"])
