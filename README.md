@@ -51,7 +51,8 @@ optimizer.step()
 
 **Basic hyperparameters:**
 
-TLDR: Start with a learning rate around 3x smaller than adam's. There is no b2 or epsilon.
+TLDR: Start with a learning rate around 3x smaller than adam's, and a weight decay 3-10x larger. 
+There is no b2 or epsilon.
 
 These next 3 settings control whether a dimension's preconditioner is diagonal or triangular. 
 For example, for a layer with shape (256, 128), triagular preconditioners would be shapes (256, 256)

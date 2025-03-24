@@ -5,9 +5,49 @@ import numpy as np
 import torch
 from torch import Tensor
 import torch.distributed as dist
-from torch.backends import opt_einsum
 
-opt_einsum.set_flags(True, "optimal")
+
+class ProbScheduler:
+    """Scheduler for annealing preconditioner update probability.
+    
+    Implements an exponential anneal with a flat start.
+    """
+    
+    def __init__(self, max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=500):
+        self.max_prob = torch.tensor(max_prob, dtype=torch.float32)
+        self.min_prob = torch.tensor(min_prob, dtype=torch.float32)
+        self.decay = torch.tensor(decay, dtype=torch.float32)
+        self.flat_start = torch.tensor(flat_start, dtype=torch.float32)
+        # Make compiled function optional to avoid pickling issues
+        self._compiled = False
+        try:
+            self._compiled_schedule = torch.compile(self._schedule_fn)
+            self._compiled = True
+        except Exception:
+            # Fallback to non-compiled version if compilation fails
+            pass
+    
+    def _schedule_fn(self, n):
+        """Exponential anneal with flat start."""
+        prob = self.max_prob * torch.exp(-self.decay * (n - self.flat_start))
+        prob.clamp_(min=self.min_prob, max=self.max_prob)
+        return prob
+    
+    def __call__(self, n):
+        """Call schedule function, using compiled version if available."""
+        if self._compiled:
+            return self._compiled_schedule(n)
+        else:
+            return self._schedule_fn(n)
+    
+    def __reduce__(self):
+        """Enable proper pickling by serializing only the parameters."""
+        return (self.__class__, (
+            self.max_prob.item(),
+            self.min_prob.item(),
+            self.decay.item(),
+            self.flat_start.item()
+        ))
 
 
 def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_start=500):
@@ -21,19 +61,7 @@ def precond_update_prob_schedule(max_prob=1.0, min_prob=0.03, decay=0.001, flat_
     `min_prob` by 4000 steps. Default settings work very well for most models and
     training regimes.
     """
-    max_prob_ = torch.tensor(max_prob, dtype=torch.float32)
-    min_prob_ = torch.tensor(min_prob, dtype=torch.float32)
-    decay_ = torch.tensor(decay, dtype=torch.float32)
-    flat_start_ = torch.tensor(flat_start, dtype=torch.float32)
-
-    @torch.compile
-    def _schedule(n):
-        """Exponential anneal with flat start."""
-        prob = max_prob_ * torch.exp(-decay_ * (n - flat_start_))
-        prob.clamp_(min=min_prob_, max=max_prob_)
-        return prob
-
-    return _schedule
+    return ProbScheduler(max_prob, min_prob, decay, flat_start)
 
 
 class OneSidedKron(torch.optim.Optimizer):
