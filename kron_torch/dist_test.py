@@ -92,7 +92,12 @@ def main():
         transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    dataset_root = './data'
+    if rank == 0:
+        datasets.MNIST(dataset_root, train=True, download=True)
+    dist.barrier()
+    dataset = datasets.MNIST(dataset_root, train=True, download=False, transform=transform)
+
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=world_size, rank=rank)
     batch_size = max(1, int(64 // world_size))
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, sampler=sampler)
@@ -109,44 +114,36 @@ def main():
         world_size=world_size
     )
 
-    try:
-        print(f"Training with DistributedKron on rank {rank}")
-        success = train(model, device, loader, optimizer, 1, rank, initial_params)
-        if rank == 0 and not success:
-            print("DistributedKron test failed!")
+    print(f"Training with DistributedKron on rank {rank}")
+    success = train(model, device, loader, optimizer, 1, rank, initial_params)
+    if rank == 0 and not success:
+        print("DistributedKron test failed!")
 
-        dist.barrier()
-        torch.cuda.synchronize()
+    dist.barrier()
+    torch.cuda.synchronize()
 
-        model = DDP(SimpleNet().to(device), device_ids=[rank])
-        initial_params = [(name, param.clone().detach()) for name, param in model.module.named_parameters()]
+    model = DDP(SimpleNet().to(device), device_ids=[rank])
+    initial_params = [(name, param.clone().detach()) for name, param in model.module.named_parameters()]
 
-        optimizer = DistributedOneSidedKron(
-            model.parameters(),
-            lr=lr,
-            preconditioner_update_probability=1.0,
-            rank=rank,
-            world_size=world_size
-        )
+    optimizer = DistributedOneSidedKron(
+        model.parameters(),
+        lr=lr,
+        preconditioner_update_probability=1.0,
+        rank=rank,
+        world_size=world_size
+    )
 
-        print(f"Training with DistributedOneSidedKron on rank {rank}")
-        success = train(model, device, loader, optimizer, 1, rank, initial_params)
-        if rank == 0 and not success:
-            print("DistributedOneSidedKron test failed!")
+    print(f"Training with DistributedOneSidedKron on rank {rank}")
+    success = train(model, device, loader, optimizer, 1, rank, initial_params)
+    if rank == 0 and not success:
+        print("DistributedOneSidedKron test failed!")
 
-        dist.barrier()
-        torch.cuda.synchronize()
+    dist.barrier()
+    torch.cuda.synchronize()
 
-    except Exception as e:
-        print(f"Rank {rank} encountered error: {e}")
-        raise e
-    finally:
-        try:
-            dist.barrier()
-            torch.cuda.synchronize()
-            dist.destroy_process_group()
-        except Exception as e:
-            print(f"Rank {rank} cleanup error: {e}")
+    dist.barrier()
+    torch.cuda.synchronize()
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

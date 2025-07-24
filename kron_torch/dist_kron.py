@@ -177,7 +177,6 @@ class Kron(torch.optim.Optimizer):
                 param_idx = base_i + self.rank
                 if param_idx < num_params:
                     p = group["params"][param_idx]
-
                     g = torch.zeros(group["update_buffer"].size(1), dtype=self.dtype, device="cuda")
 
                     if p.grad is not None:
@@ -265,8 +264,8 @@ class Kron(torch.optim.Optimizer):
                             _clip_update_rms(g)
 
                         g = g.flatten()
-                    else:
-                        g = torch.zeros(group["update_buffer"].size(1), dtype=self.dtype, device="cuda")
+                else:
+                    g = torch.zeros(group["update_buffer"].size(1), dtype=self.dtype, device="cuda")
 
                 with torch.cuda.stream(self.comm_stream):
                     handle = dist.all_gather_into_tensor(group["update_buffer"], g, async_op=True)
