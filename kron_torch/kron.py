@@ -15,30 +15,25 @@ class ProbScheduler:
         self.min_prob = torch.tensor(min_prob, dtype=torch.float32)
         self.decay = torch.tensor(decay, dtype=torch.float32)
         self.flat_start = torch.tensor(flat_start, dtype=torch.float32)
-        # Make compiled function optional to avoid pickling issues
         self._compiled = False
         try:
             self._compiled_schedule = torch.compile(self._schedule_fn)
             self._compiled = True
         except Exception:
-            # Fallback to non-compiled version if compilation fails
             pass
     
     def _schedule_fn(self, n):
-        """Exponential anneal with flat start."""
         prob = self.max_prob * torch.exp(-self.decay * (n - self.flat_start))
         prob.clamp_(min=self.min_prob, max=self.max_prob)
         return prob
     
     def __call__(self, n):
-        """Call schedule function, using compiled version if available."""
         if self._compiled:
             return self._compiled_schedule(n)
         else:
             return self._schedule_fn(n)
     
     def __reduce__(self):
-        """Enable proper pickling by serializing only the parameters."""
         return (self.__class__, (
             self.max_prob.item(),
             self.min_prob.item(),

@@ -18,30 +18,25 @@ class ProbScheduler:
         self.min_prob = torch.tensor(min_prob, dtype=torch.float32)
         self.decay = torch.tensor(decay, dtype=torch.float32)
         self.flat_start = torch.tensor(flat_start, dtype=torch.float32)
-        # Make compiled function optional to avoid pickling issues
         self._compiled = False
         try:
             self._compiled_schedule = torch.compile(self._schedule_fn)
             self._compiled = True
         except Exception:
-            # Fallback to non-compiled version if compilation fails
             pass
     
     def _schedule_fn(self, n):
-        """Exponential anneal with flat start."""
         prob = self.max_prob * torch.exp(-self.decay * (n - self.flat_start))
         prob.clamp_(min=self.min_prob, max=self.max_prob)
         return prob
     
     def __call__(self, n):
-        """Call schedule function, using compiled version if available."""
         if self._compiled:
             return self._compiled_schedule(n)
         else:
             return self._schedule_fn(n)
     
     def __reduce__(self):
-        """Enable proper pickling by serializing only the parameters."""
         return (self.__class__, (
             self.max_prob.item(),
             self.min_prob.item(),
@@ -140,6 +135,7 @@ class OneSidedKron(torch.optim.Optimizer):
         self._prob_step = torch.tensor(0, dtype=torch.int32)
         self._update_counter = torch.tensor(0, dtype=torch.int32)
         self.dtype = dtype
+        self.comm_stream = torch.cuda.Stream()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -158,81 +154,80 @@ class OneSidedKron(torch.optim.Optimizer):
             self._update_counter = torch.tensor(0, dtype=torch.int32)
 
         for group in self.param_groups:
-            handle = None
-            params_world = None
-            pending_update = False
+            prev_handle = None
+            prev_pworld = None
 
-            def update_prev():
-                nonlocal pending_update
-                if params_world and handle and pending_update:
-                    handle.wait()
-                    updates = [
-                        g_world.view_as(p_world)
-                        for p_world, g_world in zip(
-                            params_world, group["update_buffer_views"][: len(params_world)]
+            num_params = len(group["params"])
+            for base_i in range(0, num_params, self.world_size):
+                param_idx = base_i + self.rank
+                if param_idx < num_params:
+                    p = group["params"][param_idx]
+                    g = torch.zeros(group["update_buffer"].size(1), dtype=self.dtype, device="cuda")
+
+                    if p.grad is not None:
+                        g = p.grad.to(self.dtype)
+
+                        state = self.state[p]
+
+                        if g.dim() > 2 and group.get('merge_dims', True):
+                            if "merged_shape" not in state:
+                                shape1 = [np.prod(g.shape[:-1]), g.shape[-1]]
+                                shape2 = [g.shape[0], np.prod(g.shape[1:])]
+                                shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
+                                state["merged_shape"] = shape
+                            g = g.view(*state["merged_shape"])
+
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                            state["Q"] = torch.eye(min(g.shape), dtype=self.dtype, device=g.device)
+                            state["step"] = torch.tensor(0, dtype=torch.int32, device="cuda")
+                        state["step"] += 1
+                        g = _update_momentum(
+                            state["momentum_buffer"],
+                            g,
+                            torch.tensor(group["b1"], dtype=self.dtype, device="cuda"),
+                            state["step"].to(dtype=self.dtype)
                         )
-                    ]
+
+                        if do_update:
+                            state["Q"] = _oneside_precond_update(
+                                g,
+                                state["Q"],
+                                torch.tensor(group["precond_lr"], dtype=self.dtype, device="cuda"),
+                            )
+                        g = _oneside_precond_g(g, state["Q"])
+                        if group["clip_update_rms"]:
+                            _clip_update_rms(g)
+                        g = g.flatten()
+                else:
+                    g = torch.zeros(group["update_buffer"].size(1), dtype=self.dtype, device="cuda")
+
+                with torch.cuda.stream(self.comm_stream):
+                    handle = dist.all_gather_into_tensor(group["update_buffer"], g, async_op=True)
+                if prev_handle is not None:
+                    prev_handle.wait()
+                    views = group["update_buffer_views"][: len(prev_pworld)]
+                    updates = [v.view_as(pw) for v, pw in zip(views, prev_pworld)]
                     _update_params(
-                        params_world,
+                        prev_pworld,
                         updates,
                         torch.tensor(group["weight_decay"], dtype=self.dtype, device="cuda"),
                         torch.tensor(group["lr"], dtype=self.dtype, device="cuda"),
                     )
-                    pending_update = False
-
-            num_params = len(group["params"])
-            for base_i in range(0, num_params, self.world_size):
-                update_prev()
-                param_idx = base_i + self.rank
-                if param_idx < num_params:
-                    p = group["params"][param_idx]
-                    if p.grad is None:
-                        continue
-
-                    g = p.grad.to(self.dtype)
-                    state = self.state[p]
-
-                    if g.dim() > 2 and group.get('merge_dims', True):
-                        if "merged_shape" not in state:
-                            shape1 = [np.prod(g.shape[:-1]), g.shape[-1]]
-                            shape2 = [g.shape[0], np.prod(g.shape[1:])]
-                            shape = shape1 if np.diff(shape1) <= np.diff(shape2) else shape2
-                            state["merged_shape"] = shape
-                        g = g.view(*state["merged_shape"])
-
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                        state["Q"] = torch.eye(min(g.shape), dtype=self.dtype, device=g.device)
-                        state["step"] = torch.tensor(0, dtype=torch.int32, device="cuda")
-                    state["step"] += 1
-                    g = _update_momentum(
-                        state["momentum_buffer"],
-                        g,
-                        torch.tensor(group["b1"], dtype=self.dtype, device="cuda"),
-                        state["step"]
-                    )
-
-                    if do_update:
-                        state["Q"] = _oneside_precond_update(
-                            g,
-                            state["Q"],
-                            torch.tensor(group["precond_lr"], dtype=self.dtype, device="cuda"),
-                        )
-                    g = _oneside_precond_g(g, state["Q"])
-                    if group["clip_update_rms"]:
-                        _clip_update_rms(g)
-                    g = g.flatten()
-                else:
-                    g = group["update_buffer_views"][self.rank].zero_()
-
-                handle = dist.all_gather_into_tensor(group["update_buffer"], g, async_op=True)
-                params_world = group["params"][base_i : min(base_i + self.world_size, num_params)]
-                pending_update = True
-
-            update_prev()
-
-        self._adam.step()
-
+                prev_handle = handle
+                prev_pworld = group["params"][base_i : min(base_i + self.world_size, num_params)]
+            if prev_handle is not None:
+                prev_handle.wait()
+                views = group["update_buffer_views"][: len(prev_pworld)]
+                updates = [v.view_as(pw) for v, pw in zip(views, prev_pworld)]
+                _update_params(
+                    prev_pworld,
+                    updates,
+                    torch.tensor(group["weight_decay"], dtype=self.dtype, device="cuda"),
+                    torch.tensor(group["lr"], dtype=self.dtype, device="cuda"),
+                )
+        if self._adam.param_groups:
+            self._adam.step()
         return loss
 
 

@@ -25,20 +25,17 @@ class ProbScheduler:
             pass
     
     def _schedule_fn(self, n):
-        """Exponential anneal with flat start."""
         prob = self.max_prob * torch.exp(-self.decay * (n - self.flat_start))
         prob.clamp_(min=self.min_prob, max=self.max_prob)
         return prob
     
     def __call__(self, n):
-        """Call schedule function, using compiled version if available."""
         if self._compiled:
             return self._compiled_schedule(n)
         else:
             return self._schedule_fn(n)
     
     def __reduce__(self):
-        """Enable proper pickling by serializing only the parameters."""
         return (self.__class__, (
             self.max_prob.item(),
             self.min_prob.item(),
